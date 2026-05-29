@@ -69,7 +69,7 @@ function postJson(pathname, body, projectDir) {
       response.on('end', () => {
         const text = Buffer.concat(chunks).toString('utf8');
         if ((response.statusCode || 500) < 200 || (response.statusCode || 500) >= 300) {
-          reject(new Error(text || \`live-npm server returned \${response.statusCode}\`));
+          reject(new Error(readErrorMessage(text) || \`live-npm server returned \${response.statusCode}\`));
           return;
         }
         try {
@@ -84,6 +84,21 @@ function postJson(pathname, body, projectDir) {
     });
     request.end(payload);
   });
+}
+
+function readErrorMessage(text) {
+  if (!text) {
+    return '';
+  }
+  try {
+    const body = JSON.parse(text);
+    if (body && typeof body.error === 'string') {
+      return body.error;
+    }
+  } catch (error) {
+    return text;
+  }
+  return text;
 }
 
 function readLivePackageName(wantedDependency) {
@@ -281,41 +296,42 @@ module.exports = {
 export function createPnpmfileCjs(): string {
   return `const livePnpm = require('./pnpm-hooks.cjs');
 
-module.exports = {
-  hooks: {
-    importPackage: livePnpm.importPackage,
-  },
-  resolvers: [
-    livePnpm.resolver,
-  ],
-  fetchers: [
-    livePnpm.fetcher,
-  ],
+module.exports = function useLiveNPM(pnpmfile) {
+  const base = pnpmfile && typeof pnpmfile === 'object' ? pnpmfile : {};
+  const baseHooks = base.hooks && typeof base.hooks === 'object' ? base.hooks : {};
+  const resolvers = Array.isArray(base.resolvers) ? base.resolvers : [];
+  const fetchers = Array.isArray(base.fetchers) ? base.fetchers : [];
+
+  return {
+    ...base,
+    hooks: {
+      ...baseHooks,
+      importPackage: livePnpm.importPackage,
+    },
+    resolvers: [
+      ...resolvers,
+      livePnpm.resolver,
+    ],
+    fetchers: [
+      ...fetchers,
+      livePnpm.fetcher,
+    ],
+  };
 };
 `;
 }
 
-export function createRootPnpmfileShim(): string {
-  return `module.exports = require('./.live-npm/pnpmfile.cjs');
-`;
-}
-
-export function createPnpmfileMergeSnippet(): string {
-  return `const livePnpm = require('./.live-npm/pnpm-hooks.cjs');
-
-module.exports = {
-  hooks: {
-    // Keep your existing hooks here.
-    importPackage: livePnpm.importPackage,
-  },
-  resolvers: [
-    // Keep your existing resolvers here.
-    livePnpm.resolver,
-  ],
-  fetchers: [
-    // Keep your existing fetchers here.
-    livePnpm.fetcher,
-  ],
-};
+export function createRootPnpmfileLiveBlock(): string {
+  return `// <live-npm>
+(() => {
+  let useLiveNPM;
+  try {
+    useLiveNPM = require('./.live-npm/pnpmfile.cjs');
+  } catch (error) {
+    return;
+  }
+  module.exports = useLiveNPM(module.exports);
+})();
+// </live-npm>
 `;
 }

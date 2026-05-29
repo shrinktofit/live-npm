@@ -54,6 +54,23 @@ describe('loadConfig', () => {
       ],
     });
   });
+
+  it('allows the default empty integrate config', async () => {
+    const root = await makeTempDir();
+    const configPath = path.join(root, 'live-npm.yaml');
+    await writeFile(configPath, [
+      'debounceMs: 200',
+      'packages: []',
+      'workspaces: []',
+      '',
+    ].join('\n'));
+
+    await expect(loadConfig(configPath)).resolves.toEqual({
+      debounceMs: 200,
+      packages: [],
+      workspaces: [],
+    });
+  });
 });
 
 async function makeTempDir(): Promise<string> {

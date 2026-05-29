@@ -41,4 +41,66 @@ describe('rewritePublishManifest', () => {
       'package-g': '^7.0.0',
     });
   });
+
+  it('uses live specs only for installable workspace dependencies', () => {
+    const manifest = rewritePublishManifest({
+      name: 'package-a',
+      version: '1.0.0',
+      dependencies: {
+        'package-b': 'workspace:*',
+      },
+      devDependencies: {
+        'package-dev': 'workspace:*',
+      },
+      optionalDependencies: {
+        'package-optional': 'workspace:*',
+      },
+      peerDependencies: {
+        'package-peer': 'workspace:^',
+      },
+    }, {
+      catalogs: {
+        default: {},
+        named: {},
+      },
+      liveDependencyNames: ['package-b', 'package-dev', 'package-optional', 'package-peer'],
+      workspaceVersions: {
+        'package-b': '2.0.0',
+        'package-dev': '3.0.0',
+        'package-optional': '4.0.0',
+        'package-peer': '5.0.0',
+      },
+    });
+
+    expect(manifest).toMatchObject({
+      dependencies: {
+        'package-b': 'live:package-b',
+      },
+      devDependencies: {
+        'package-dev': '3.0.0',
+      },
+      optionalDependencies: {
+        'package-optional': 'live:package-optional',
+      },
+      peerDependencies: {
+        'package-peer': '^5.0.0',
+      },
+    });
+  });
+
+  it('fails when a workspace protocol references a package without a version', () => {
+    expect(() => rewritePublishManifest({
+      name: 'package-a',
+      version: '1.0.0',
+      peerDependencies: {
+        'package-peer': 'workspace:^',
+      },
+    }, {
+      catalogs: {
+        default: {},
+        named: {},
+      },
+      workspaceVersions: {},
+    })).toThrow('package-peer uses workspace:^');
+  });
 });

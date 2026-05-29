@@ -58,8 +58,10 @@ export async function runCli(args: string[]): Promise<void> {
       }
       if (result.createdRootPnpmfile && result.rootPnpmfilePath) {
         consoleLogger.info(`wrote ${result.rootPnpmfilePath}`);
-      } else if (result.rootPnpmfilePath && result.snippetPath) {
-        consoleLogger.warn(`${result.rootPnpmfilePath} already exists; merge ${result.snippetPath} manually.`);
+      } else if (result.rootPnpmfileAction === 'updated' && result.rootPnpmfilePath) {
+        consoleLogger.info(`updated ${result.rootPnpmfilePath}`);
+      } else if (result.rootPnpmfilePath) {
+        consoleLogger.info(`kept existing ${result.rootPnpmfilePath}`);
       }
       consoleLogger.info('add .live-npm/ to your project .gitignore for local-only integration files.');
     })

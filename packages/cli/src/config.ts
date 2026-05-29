@@ -48,10 +48,6 @@ export async function loadConfig(configPath: string): Promise<LiveNpmConfig> {
   if (!Array.isArray(rawWorkspaces)) {
     throw new Error(`Config ${resolvedConfigPath} workspaces must be an array.`);
   }
-  if (rawPackages.length === 0 && rawWorkspaces.length === 0) {
-    throw new Error(`Config ${resolvedConfigPath} must contain packages or workspaces.`);
-  }
-
   const debounceMs = data.debounceMs === undefined ? 200 : readPositiveInteger(data.debounceMs, 'debounceMs');
   return {
     debounceMs,

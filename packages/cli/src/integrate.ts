@@ -2,10 +2,10 @@ import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import {
   createPnpmHooksCjs,
-  createPnpmfileMergeSnippet,
   createPnpmfileCjs,
-  createRootPnpmfileShim,
+  createRootPnpmfileLiveBlock,
 } from './pnpm-hook-template.js';
+import { createIntegrationVersionFile, integrationVersionFileName } from './integration-version.js';
 
 export interface IntegrateOptions {
   projectDir: string;
@@ -16,11 +16,13 @@ export interface IntegrateResult {
   configPath: string;
   createdRootPnpmfile: boolean;
   liveDir: string;
+  rootPnpmfileAction: 'created' | 'updated' | 'unchanged';
   rootPnpmfilePath?: string;
-  snippetPath?: string;
 }
 
 const liveDirName = '.live-npm';
+const livePnpmfileStartMarker = '// <live-npm>';
+const livePnpmfileEndMarker = '// </live-npm>';
 
 export async function integrateProject(options: IntegrateOptions): Promise<IntegrateResult> {
   const projectDir = path.resolve(options.projectDir);
@@ -30,33 +32,27 @@ export async function integrateProject(options: IntegrateOptions): Promise<Integ
   await mkdir(liveDir, { recursive: true });
   await writeFile(path.join(liveDir, 'pnpm-hooks.cjs'), createPnpmHooksCjs());
   await writeFile(path.join(liveDir, 'pnpmfile.cjs'), createPnpmfileCjs());
+  await writeFile(
+    path.join(liveDir, integrationVersionFileName),
+    `${JSON.stringify(await createIntegrationVersionFile(), null, 2)}\n`,
+  );
   await writeFile(path.join(liveDir, '.gitignore'), liveGitignore());
   await writeFile(path.join(liveDir, 'README.md'), liveReadme());
   const configPath = path.join(liveDir, 'config.yaml');
   const configCreated = await writeFileIfMissing(configPath, defaultConfigYaml());
 
-  const rootPnpmfilePath = await findRootPnpmfile(projectDir);
-  if (!rootPnpmfilePath) {
-    const generatedRootPnpmfile = path.join(projectDir, '.pnpmfile.cjs');
-    await writeFile(generatedRootPnpmfile, createRootPnpmfileShim());
-    return {
-      configCreated,
-      configPath,
-      createdRootPnpmfile: true,
-      liveDir,
-      rootPnpmfilePath: generatedRootPnpmfile,
-    };
-  }
+  await assertNoRootPnpmfileMjs(projectDir);
+  const rootPnpmfilePath = path.join(projectDir, '.pnpmfile.cjs');
+  const rootPnpmfileExists = await exists(rootPnpmfilePath);
+  const rootPnpmfileAction = await upsertRootPnpmfileLiveBlock(rootPnpmfilePath);
 
-  const snippetPath = path.join(liveDir, 'pnpmfile-snippet.cjs');
-  await writeFile(snippetPath, createPnpmfileMergeSnippet());
   return {
     configCreated,
     configPath,
-    createdRootPnpmfile: false,
+    createdRootPnpmfile: !rootPnpmfileExists,
     liveDir,
+    rootPnpmfileAction,
     rootPnpmfilePath,
-    snippetPath,
   };
 }
 
@@ -76,14 +72,40 @@ async function assertPnpm11Project(projectDir: string): Promise<void> {
   }
 }
 
-async function findRootPnpmfile(projectDir: string): Promise<string | undefined> {
-  for (const fileName of ['.pnpmfile.mjs', '.pnpmfile.cjs']) {
-    const file = path.join(projectDir, fileName);
-    if (await exists(file)) {
-      return file;
-    }
+async function assertNoRootPnpmfileMjs(projectDir: string): Promise<void> {
+  const file = path.join(projectDir, '.pnpmfile.mjs');
+  if (await exists(file)) {
+    throw new Error(`${file} exists; live-npm integrate does not support .pnpmfile.mjs yet.`);
   }
-  return undefined;
+}
+
+async function upsertRootPnpmfileLiveBlock(rootPnpmfilePath: string): Promise<IntegrateResult['rootPnpmfileAction']> {
+  const block = createRootPnpmfileLiveBlock().trimEnd();
+  if (!await exists(rootPnpmfilePath)) {
+    await writeFile(rootPnpmfilePath, `${block}\n`);
+    return 'created';
+  }
+
+  const current = await readFile(rootPnpmfilePath, 'utf8');
+  const next = upsertMarkedBlock(current, block);
+  if (next === current) {
+    return 'unchanged';
+  }
+
+  await writeFile(rootPnpmfilePath, next);
+  return 'updated';
+}
+
+function upsertMarkedBlock(contents: string, block: string): string {
+  const start = contents.indexOf(livePnpmfileStartMarker);
+  const end = contents.indexOf(livePnpmfileEndMarker);
+  if (start >= 0 && end >= start) {
+    const afterEnd = end + livePnpmfileEndMarker.length;
+    return `${contents.slice(0, start)}${block}${contents.slice(afterEnd)}`;
+  }
+
+  const prefix = contents.endsWith('\n') ? contents : `${contents}\n`;
+  return `${prefix}\n${block}\n`;
 }
 
 async function writeFileIfMissing(file: string, contents: string): Promise<boolean> {
@@ -130,5 +152,7 @@ Edit \`config.yaml\` to declare the source packages or pnpm workspaces that may 
 \`state.json\` is written after pnpm imports live packages. It lets \`live-npm start\` restore live targets after the server restarts.
 
 \`server.json\` is written while \`live-npm start\` is running. pnpm hooks read it to find this project's current local server endpoint.
+
+\`version.json\` records the live-npm integration version that generated this directory. Re-run \`live-npm integrate\` if live-npm reports that this directory is outdated.
 `;
 }

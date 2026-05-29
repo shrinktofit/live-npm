@@ -107,7 +107,38 @@ describe('startLiveNpmServer', () => {
 
     expect(warnings.join('\n')).toContain('No ');
     expect(warnings.join('\n')).toContain('state.json');
+    expect(warnings.join('\n')).toContain('version.json');
+    expect(warnings.join('\n')).toContain('live-npm integrate');
     expect(warnings.join('\n')).toContain('Run pnpm install once');
+  });
+
+  it('warns when the project integration version is outdated', async () => {
+    const root = await makeTempDir();
+    const warnings: string[] = [];
+    await mkdir(path.join(root, '.live-npm'), { recursive: true });
+    await writeFile(path.join(root, '.live-npm/config.yaml'), 'packages: []\nworkspaces: []\n');
+    await writeFile(path.join(root, '.live-npm/state.json'), JSON.stringify({
+      imports: [],
+      version: 1,
+    }, null, 2));
+    await writeFile(path.join(root, '.live-npm/version.json'), JSON.stringify({
+      generatedAt: new Date().toISOString(),
+      integrationVersion: 1,
+      liveNpmVersion: '0.0.0',
+      pnpmfileMode: 'legacy-snippet',
+      schemaVersion: 1,
+    }, null, 2));
+
+    server = await startLiveNpmServer({
+      host: '127.0.0.1',
+      logger: createTestLogger(warnings),
+      port: 0,
+      projectDirs: [root],
+    });
+
+    expect(warnings.join('\n')).toContain('integration version 1');
+    expect(warnings.join('\n')).toContain('Current integration version is 2');
+    expect(warnings.join('\n')).toContain('live-npm integrate');
   });
 
   it('writes server endpoint state and rejects a second running server for the same project', async () => {
@@ -134,6 +165,140 @@ describe('startLiveNpmServer', () => {
       port: 0,
       projectDirs: [root],
     })).rejects.toThrow('already running');
+  });
+
+  it('removes its server endpoint state when it closes', async () => {
+    const root = await makeTempDir();
+    await mkdir(path.join(root, '.live-npm'), { recursive: true });
+    await writeFile(path.join(root, '.live-npm/config.yaml'), 'packages: []\nworkspaces: []\n');
+
+    server = await startLiveNpmServer({
+      host: '127.0.0.1',
+      logger: silentLogger,
+      port: 0,
+      projectDirs: [root],
+    });
+
+    await expect(readFile(path.join(root, '.live-npm/server.json'), 'utf8')).resolves.toContain(server.url);
+    await server.close();
+    server = undefined;
+    await expect(readFile(path.join(root, '.live-npm/server.json'), 'utf8')).rejects.toThrow();
+  });
+
+  it('does not remove a newer server endpoint state when an older server closes', async () => {
+    const root = await makeTempDir();
+    await mkdir(path.join(root, '.live-npm'), { recursive: true });
+    await writeFile(path.join(root, '.live-npm/config.yaml'), 'packages: []\nworkspaces: []\n');
+
+    server = await startLiveNpmServer({
+      host: '127.0.0.1',
+      logger: silentLogger,
+      port: 0,
+      projectDirs: [root],
+    });
+
+    const replacementState = {
+      ...await readServerState(root),
+      token: 'replacement-token',
+      url: 'http://127.0.0.1:65535',
+    };
+    await writeFile(path.join(root, '.live-npm/server.json'), `${JSON.stringify(replacementState, null, 2)}\n`);
+    await server.close();
+    server = undefined;
+
+    await expect(readServerState(root)).resolves.toMatchObject({
+      token: 'replacement-token',
+      url: 'http://127.0.0.1:65535',
+    });
+  });
+
+  it('requires the per-project token for health and package requests', async () => {
+    const root = await makeTempDir();
+    await mkdir(path.join(root, '.live-npm'), { recursive: true });
+    await writeFile(path.join(root, '.live-npm/config.yaml'), 'packages: []\nworkspaces: []\n');
+
+    server = await startLiveNpmServer({
+      host: '127.0.0.1',
+      logger: silentLogger,
+      port: 0,
+      projectDirs: [root],
+    });
+
+    await expect(requestJson(server.url, '/health')).resolves.toMatchObject({
+      statusCode: 401,
+    });
+    await expect(requestJson(server.url, '/health', { token: 'wrong-token' })).resolves.toMatchObject({
+      statusCode: 401,
+    });
+
+    const serverState = await readServerState(root);
+    await expect(requestJson(server.url, '/health', { token: serverState.token })).resolves.toMatchObject({
+      statusCode: 200,
+    });
+    await expect(requestJson(server.url, '/resolve', {
+      body: {
+        packageName: 'sample-package',
+        projectDir: root,
+      },
+      method: 'POST',
+    })).resolves.toMatchObject({
+      statusCode: 401,
+    });
+  });
+
+  it('returns a clear error when a live package is not configured', async () => {
+    const root = await makeTempDir();
+    await mkdir(path.join(root, '.live-npm'), { recursive: true });
+    await writeFile(path.join(root, '.live-npm/config.yaml'), 'packages: []\nworkspaces: []\n');
+
+    server = await startLiveNpmServer({
+      host: '127.0.0.1',
+      logger: silentLogger,
+      port: 0,
+      projectDirs: [root],
+    });
+
+    const serverState = await readServerState(root);
+    const response = await requestJson(server.url, '/resolve', {
+      body: {
+        packageName: 'sample-package',
+        projectDir: root,
+      },
+      method: 'POST',
+      token: serverState.token,
+    });
+
+    expect(response.statusCode).toBe(500);
+    expect(response.body).toContain('live-npm cannot resolve live:sample-package');
+    expect(response.body).toContain('has no source packages or workspaces configured');
+    expect(response.body).not.toContain('at loadConfig');
+  });
+
+  it('reuses the previous project port when it is available', async () => {
+    const root = await makeTempDir();
+    const previousPort = await reserveFreePort();
+    await mkdir(path.join(root, '.live-npm'), { recursive: true });
+    await writeFile(path.join(root, '.live-npm/config.yaml'), 'packages: []\nworkspaces: []\n');
+    await writeFile(path.join(root, '.live-npm/server.json'), JSON.stringify({
+      pid: 1,
+      projectDir: root,
+      startedAt: new Date().toISOString(),
+      token: 'stale-token',
+      url: `http://127.0.0.1:${previousPort}`,
+      version: 1,
+    }, null, 2));
+
+    server = await startLiveNpmServer({
+      host: '127.0.0.1',
+      logger: silentLogger,
+      port: 0,
+      projectDirs: [root],
+    });
+
+    expect(server.url).toBe(`http://127.0.0.1:${previousPort}`);
+    const serverState = await readServerState(root);
+    expect(serverState.url).toBe(server.url);
+    expect(serverState.token).not.toBe('stale-token');
   });
 
   it('reuses the previous port when possible and falls back if it is occupied', async () => {
@@ -166,6 +331,8 @@ describe('startLiveNpmServer', () => {
       expect(server.url).not.toBe(`http://127.0.0.1:${occupiedPort}`);
       expect(warnings.join('\n')).toContain('Previous live-npm port');
       expect(warnings.join('\n')).toContain('reinstall is not required');
+      const serverState = await readServerState(root);
+      expect(serverState.url).toBe(server.url);
     } finally {
       await new Promise<void>((resolve, reject) => {
         occupiedServer.close((error) => {
@@ -200,7 +367,7 @@ function createTestLogger(warnings: string[]): Logger {
 async function postJson(baseUrl: string, pathname: string, body: unknown, projectDir: string): Promise<unknown> {
   const url = new URL(pathname, baseUrl);
   const payload = Buffer.from(JSON.stringify(body));
-  const serverState = JSON.parse(await readFile(path.join(projectDir, '.live-npm/server.json'), 'utf8')) as { token: string };
+  const serverState = await readServerState(projectDir);
   return await new Promise((resolve, reject) => {
     const request = http.request({
       headers: {
@@ -227,6 +394,66 @@ async function postJson(baseUrl: string, pathname: string, body: unknown, projec
     request.on('error', reject);
     request.end(payload);
   });
+}
+
+interface JsonRequestOptions {
+  body?: unknown;
+  method?: string;
+  token?: string;
+}
+
+interface JsonResponse {
+  body: string;
+  statusCode: number;
+}
+
+async function requestJson(baseUrl: string, pathname: string, options: JsonRequestOptions = {}): Promise<JsonResponse> {
+  const url = new URL(pathname, baseUrl);
+  const payload = options.body === undefined
+    ? undefined
+    : Buffer.from(JSON.stringify(options.body));
+  const headers: Record<string, string> = {};
+  if (payload) {
+    headers['content-length'] = String(payload.byteLength);
+    headers['content-type'] = 'application/json';
+  }
+  if (options.token) {
+    headers['x-live-npm-token'] = options.token;
+  }
+
+  return await new Promise((resolve, reject) => {
+    const request = http.request({
+      headers,
+      host: url.hostname,
+      method: options.method ?? 'GET',
+      path: url.pathname,
+      port: url.port,
+    }, (response) => {
+      const chunks: Buffer[] = [];
+      response.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+      response.on('end', () => {
+        resolve({
+          body: Buffer.concat(chunks).toString('utf8'),
+          statusCode: response.statusCode ?? 0,
+        });
+      });
+    });
+    request.on('error', reject);
+    request.end(payload);
+  });
+}
+
+interface ServerState {
+  pid: number;
+  projectDir: string;
+  startedAt: string;
+  token: string;
+  url: string;
+  version: 1;
+}
+
+async function readServerState(root: string): Promise<ServerState> {
+  return JSON.parse(await readFile(path.join(root, '.live-npm/server.json'), 'utf8')) as ServerState;
 }
 
 async function writeSourcePackage(source: string, contents: string): Promise<void> {
@@ -273,4 +500,19 @@ async function listenOnRandomPort(server: http.Server): Promise<number> {
       resolve(address.port);
     });
   });
+}
+
+async function reserveFreePort(): Promise<number> {
+  const server = http.createServer();
+  const port = await listenOnRandomPort(server);
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve();
+    });
+  });
+  return port;
 }

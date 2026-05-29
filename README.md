@@ -38,16 +38,17 @@ live-npm integrate
 
 - `.live-npm/pnpm-hooks.cjs`
 - `.live-npm/pnpmfile.cjs`
+- `.live-npm/version.json`
 - `.live-npm/config.yaml`
 - `.live-npm/state.json` after pnpm imports live packages
 - `.live-npm/server.json` while a project server is running
-- `.live-npm/pnpmfile-snippet.cjs` when a root pnpmfile already exists
 
 If `.live-npm/config.yaml` already exists, `integrate` keeps it unchanged.
+`integrate` updates `.live-npm/version.json` every time so `live-npm start` can detect old project integration files and prompt you to refresh them. The current integration mode is recorded as `cjs-marked-block`.
 
 Add `.live-npm/` to the consuming project's `.gitignore` unless you intentionally want to share local integration files.
 
-pnpm still needs an entry point. If the project has no `.pnpmfile.cjs` or `.pnpmfile.mjs`, `integrate` creates a tiny root `.pnpmfile.cjs` shim that loads `.live-npm/pnpmfile.cjs`. If a root pnpmfile already exists, `integrate` does not edit it; merge the generated `.live-npm/pnpmfile-snippet.cjs` manually. pnpm supports only one `hooks.importPackage`, so projects that already customize `importPackage` need to wrap or delegate that hook explicitly.
+pnpm still needs an entry point. `integrate` creates or updates the root `.pnpmfile.cjs` with a marked live-npm block that loads `.live-npm/pnpmfile.cjs` and merges live-npm hooks into the existing pnpmfile export. Re-running `integrate` updates that marked block instead of duplicating it. Root `.pnpmfile.mjs` is not supported yet.
 
 ## Config
 
@@ -70,6 +71,8 @@ Config paths are resolved relative to `.live-npm/config.yaml`. There is no `targ
 `live-npm` uses `npm-packlist`, so copied files follow npm publish / pack rules. If the source package does not declare `package.json#files`, npm's default packlist behavior is used.
 
 Workspace mode currently supports pnpm only. `live-npm` infers the package manager from `package.json#packageManager`, `pnpm-workspace.yaml`, and `pnpm-lock.yaml`; npm, yarn, and bun workspaces are rejected for now. It expands the local workspace dependency closure through `dependencies`, `optionalDependencies`, and `peerDependencies`; `devDependencies` are not included.
+
+An empty config is valid immediately after `integrate`, but it cannot resolve any `live:` package yet. If `pnpm install` reports that `.live-npm/config.yaml` has no source packages or workspaces configured, add either a `packages` entry or a `workspaces` entry whose `includes` contains the `live:` package name.
 
 ## Usage
 
@@ -108,6 +111,24 @@ pnpm install
 ```
 
 During install, pnpm asks live-npm to resolve and fetch `live:` packages. After import, live-npm records the actual installed package directory and keeps it updated while the server is running.
+
+## Troubleshooting
+
+If `live-npm start` warns that `.live-npm/version.json` is missing or outdated, run:
+
+```powershell
+live-npm integrate
+```
+
+Then restart `live-npm start`. This refreshes generated project files such as `.live-npm/pnpm-hooks.cjs`, `.live-npm/pnpmfile.cjs`, and the marked live-npm block in the root `.pnpmfile.cjs`.
+
+If `pnpm install` says `live-npm cannot resolve live:<name>`, the server is running but the package is not declared in `.live-npm/config.yaml`. Add the package source directly under `packages`, or include it in a configured pnpm workspace.
+
+If `pnpm install` says it cannot read `.live-npm/server.json`, start the project server before installing:
+
+```powershell
+live-npm start
+```
 
 ## Notes
 
