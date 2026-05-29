@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import Arborist from '@npmcli/arborist';
@@ -46,22 +47,34 @@ export async function readManifest(source: string): Promise<PackageManifest> {
 
 export function getWatchPaths(source: string, manifest: PackageManifest): string[] {
   const files = readFilesField(manifest);
-  const watchPaths = new Set<string>([
-    path.join(source, 'package.json'),
-  ]);
+  const watchPaths: string[] = [];
+  const resolvedSource = path.resolve(source);
+  const addWatchPath = (watchPath: string) => {
+    addFoldedWatchPath(watchPaths, watchPath);
+  };
+
+  addWatchPath(path.join(resolvedSource, 'package.json'));
 
   if (files) {
+    let hasPositiveWatchPath = false;
     for (const entry of files) {
-      if (entry.startsWith('!')) {
+      const watchPath = watchPathFromFilesEntry(resolvedSource, entry);
+      if (!watchPath) {
         continue;
       }
-      watchPaths.add(path.resolve(source, entry));
+      hasPositiveWatchPath = true;
+      addWatchPath(watchPath);
+    }
+    if (!hasPositiveWatchPath) {
+      addWatchPath(resolvedSource);
     }
   } else {
-    watchPaths.add(source);
+    addWatchPath(resolvedSource);
   }
 
   for (const defaultFile of [
+    '.gitignore',
+    '.npmignore',
     'README',
     'README.md',
     'LICENSE',
@@ -70,10 +83,10 @@ export function getWatchPaths(source: string, manifest: PackageManifest): string
     'LICENCE.md',
     'NOTICE',
   ]) {
-    watchPaths.add(path.join(source, defaultFile));
+    addWatchPath(path.join(resolvedSource, defaultFile));
   }
 
-  return [...watchPaths];
+  return watchPaths;
 }
 
 function readPackageName(manifest: PackageManifest, source: string): string {
@@ -92,4 +105,90 @@ function readFilesField(manifest: PackageManifest): string[] | undefined {
 
 function normalizePacklist(files: string[]): string[] {
   return [...new Set(files.map((file) => file.replace(/\\/g, '/')))].sort();
+}
+
+function watchPathFromFilesEntry(source: string, entry: string): string | undefined {
+  const normalizedEntry = normalizeFilesEntry(entry);
+  if (!normalizedEntry || normalizedEntry.startsWith('!')) {
+    return undefined;
+  }
+
+  const stableParts: string[] = [];
+  for (const part of normalizedEntry.split('/')) {
+    if (!part || part === '.') {
+      continue;
+    }
+    if (part === '..') {
+      return source;
+    }
+    if (hasGlobToken(part)) {
+      break;
+    }
+    stableParts.push(part);
+  }
+
+  const candidate = stableParts.length === 0
+    ? source
+    : path.join(source, ...stableParts);
+  if (!isInsideOrSame(source, candidate)) {
+    return source;
+  }
+
+  return nearestExistingPath(source, candidate);
+}
+
+function normalizeFilesEntry(entry: string): string {
+  let normalized = entry.replace(/\\/g, '/');
+  while (normalized.startsWith('/')) {
+    normalized = normalized.slice(1);
+  }
+  while (normalized.startsWith('./')) {
+    normalized = normalized.slice(2);
+  }
+  return normalized;
+}
+
+function hasGlobToken(value: string): boolean {
+  return value.includes('*') || value.includes('?') || value.includes('[') || value.includes('{');
+}
+
+function nearestExistingPath(source: string, target: string): string {
+  let current = path.resolve(target);
+  const resolvedSource = path.resolve(source);
+
+  while (isInsideOrSame(resolvedSource, current)) {
+    if (existsSync(current)) {
+      return current;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      break;
+    }
+    current = parent;
+  }
+
+  return resolvedSource;
+}
+
+function addFoldedWatchPath(paths: string[], watchPath: string): void {
+  const resolvedWatchPath = path.resolve(watchPath);
+
+  for (const existing of paths) {
+    if (isInsideOrSame(existing, resolvedWatchPath)) {
+      return;
+    }
+  }
+
+  for (let index = paths.length - 1; index >= 0; index -= 1) {
+    if (isInsideOrSame(resolvedWatchPath, paths[index])) {
+      paths.splice(index, 1);
+    }
+  }
+
+  paths.push(resolvedWatchPath);
+}
+
+function isInsideOrSame(parent: string, child: string): boolean {
+  const relative = path.relative(parent, child);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }

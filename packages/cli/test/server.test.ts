@@ -53,6 +53,40 @@ describe('startLiveNpmServer', () => {
     });
   });
 
+  it('keeps packages with globbed files entries live when nested build output is added', async () => {
+    const root = await makeTempDir();
+    const source = path.join(root, 'source');
+    const target = path.join(root, 'node_modules/.pnpm/live/node_modules/sample-package');
+    await writeSourcePackage(source, 'export const value = 1;\n', ['lib/**', '!lib/**/*.map']);
+    await mkdir(path.join(root, '.live-npm'), { recursive: true });
+    await writeFile(path.join(root, '.live-npm/config.yaml'), [
+      'debounceMs: 25',
+      'packages:',
+      '  - source: ../source',
+      '',
+    ].join('\n'));
+
+    server = await startLiveNpmServer({
+      host: '127.0.0.1',
+      logger: silentLogger,
+      port: 0,
+      projectDirs: [root],
+    });
+
+    await postJson(server.url, '/register-import', {
+      destinationDir: target,
+      packageName: 'sample-package',
+      projectDir: root,
+    }, root);
+
+    await mkdir(path.join(source, 'lib/font'), { recursive: true });
+    await writeFile(path.join(source, 'lib/font/index.js'), 'export const font = 1;\n');
+
+    await waitFor(async () => {
+      await expect(readFile(path.join(target, 'lib/font/index.js'), 'utf8')).resolves.toContain('font = 1');
+    });
+  });
+
   it('restores persisted import targets after server restart', async () => {
     const root = await makeTempDir();
     const source = path.join(root, 'source');
@@ -456,12 +490,12 @@ async function readServerState(root: string): Promise<ServerState> {
   return JSON.parse(await readFile(path.join(root, '.live-npm/server.json'), 'utf8')) as ServerState;
 }
 
-async function writeSourcePackage(source: string, contents: string): Promise<void> {
+async function writeSourcePackage(source: string, contents: string, files: string[] = ['lib']): Promise<void> {
   await mkdir(path.join(source, 'lib'), { recursive: true });
   await writeFile(path.join(source, 'package.json'), JSON.stringify({
     name: 'sample-package',
     version: '0.0.0',
-    files: ['lib'],
+    files,
   }, null, 2));
   await writeFile(path.join(source, 'lib/index.js'), contents);
 }
