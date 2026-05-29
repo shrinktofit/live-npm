@@ -51,6 +51,44 @@ describe('startLiveNpmServer', () => {
       await expect(readFile(path.join(target, 'lib/index.js'), 'utf8')).resolves.toContain('value = 2');
     });
   });
+
+  it('restores persisted import targets after server restart', async () => {
+    const root = await makeTempDir();
+    const source = path.join(root, 'source');
+    const target = path.join(root, 'node_modules/.pnpm/live/node_modules/sample-package');
+    await writeSourcePackage(source, 'export const value = 1;\n');
+    await mkdir(path.join(root, '.live-npm'), { recursive: true });
+    await writeFile(path.join(root, '.live-npm/config.yaml'), [
+      'debounceMs: 25',
+      'packages:',
+      '  - source: ../source',
+      '',
+    ].join('\n'));
+
+    server = await startLiveNpmServer({
+      host: '127.0.0.1',
+      logger: silentLogger,
+      port: 0,
+    });
+    await postJson(server.url, '/register-import', {
+      destinationDir: target,
+      packageName: 'sample-package',
+      projectDir: root,
+    });
+    await server.close();
+    server = undefined;
+
+    await writeSourcePackage(source, 'export const value = 2;\n');
+    server = await startLiveNpmServer({
+      host: '127.0.0.1',
+      logger: silentLogger,
+      port: 0,
+      projectDirs: [root],
+    });
+
+    await expect(readFile(path.join(target, 'lib/index.js'), 'utf8')).resolves.toContain('value = 2');
+    await expect(readFile(path.join(root, '.live-npm/state.json'), 'utf8')).resolves.toContain('sample-package');
+  });
 });
 
 async function postJson(baseUrl: string, pathname: string, body: unknown): Promise<unknown> {

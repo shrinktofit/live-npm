@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { Buffer } from 'node:buffer';
+import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import chokidar, { type FSWatcher } from 'chokidar';
 import { loadConfig } from './config.js';
@@ -11,11 +12,13 @@ import { resolveConfiguredPackages, type ResolvedLivePackage } from './workspace
 
 const liveDirName = '.live-npm';
 const storeDirName = 'store';
+const stateFileName = 'state.json';
 
 export interface LiveNpmServerOptions {
   host: string;
   logger?: Logger;
   port: number;
+  projectDirs?: string[];
 }
 
 export interface LiveNpmServer {
@@ -47,8 +50,21 @@ interface RuntimePackage {
   watcher?: FSWatcher;
 }
 
+interface PersistedState {
+  imports: PersistedImport[];
+  version: 1;
+}
+
+interface PersistedImport {
+  destinationDir: string;
+  packageName: string;
+}
+
 export async function startLiveNpmServer(options: LiveNpmServerOptions): Promise<LiveNpmServer> {
   const manager = new LiveNpmServerManager(options.logger ?? consoleLogger);
+  for (const projectDir of options.projectDirs ?? []) {
+    await manager.restoreProject(projectDir);
+  }
   const server = createServer((request, response) => {
     void handleRequest(manager, request, response);
   });
@@ -118,10 +134,30 @@ class LiveNpmServerManager {
     const runtime = await this.ensureRuntime(request.projectDir, request.packageName);
     runtime.targets.add(path.resolve(request.destinationDir));
     await this.publishRuntime(runtime);
+    await this.writeState(runtime.projectDir);
     return {
       packageName: runtime.config.name,
       targets: [...runtime.targets],
     };
+  }
+
+  async restoreProject(projectDir: string): Promise<void> {
+    const resolvedProjectDir = path.resolve(projectDir);
+    if (!await exists(path.join(resolvedProjectDir, liveDirName, stateFileName))) {
+      return;
+    }
+
+    const state = await readState(resolvedProjectDir);
+    for (const persistedImport of state.imports) {
+      try {
+        const runtime = await this.ensureRuntime(resolvedProjectDir, persistedImport.packageName);
+        runtime.targets.add(path.resolve(persistedImport.destinationDir));
+        await this.publishRuntime(runtime);
+        this.logger.info(`restored ${persistedImport.packageName} -> ${persistedImport.destinationDir}`);
+      } catch (error) {
+        this.logger.warn(`could not restore ${persistedImport.packageName}: ${formatUnknownError(error)}`);
+      }
+    }
   }
 
   async close(): Promise<void> {
@@ -203,6 +239,28 @@ class LiveNpmServerManager {
     }));
   }
 
+  private async writeState(projectDir: string): Promise<void> {
+    const imports: PersistedImport[] = [];
+    for (const runtime of this.runtimes.values()) {
+      if (runtime.projectDir !== projectDir) {
+        continue;
+      }
+      for (const target of runtime.targets) {
+        if (target === packageStagingDir(runtime.projectDir, runtime.config.name)) {
+          continue;
+        }
+        imports.push({
+          destinationDir: target,
+          packageName: runtime.config.name,
+        });
+      }
+    }
+    await writeState(projectDir, {
+      imports: sortImports(imports),
+      version: 1,
+    });
+  }
+
   private async readPublishedManifest(config: ResolvedLivePackage): Promise<unknown> {
     const manifest = await readManifest(config.source);
     if (!config.manifestRewrite) {
@@ -210,6 +268,45 @@ class LiveNpmServerManager {
     }
     return rewritePublishManifest(manifest, config.manifestRewrite);
   }
+}
+
+async function readState(projectDir: string): Promise<PersistedState> {
+  const statePath = path.join(projectDir, liveDirName, stateFileName);
+  const data = JSON.parse(await readFile(statePath, 'utf8')) as unknown;
+  if (!isRecord(data) || data.version !== 1 || !Array.isArray(data.imports)) {
+    throw new Error(`${statePath} must contain live-npm state version 1.`);
+  }
+
+  return {
+    imports: data.imports.map(readPersistedImport),
+    version: 1,
+  };
+}
+
+async function writeState(projectDir: string, state: PersistedState): Promise<void> {
+  const liveDir = path.join(projectDir, liveDirName);
+  await mkdir(liveDir, { recursive: true });
+  await writeFile(path.join(liveDir, stateFileName), `${JSON.stringify(state, null, 2)}\n`);
+}
+
+function readPersistedImport(value: unknown): PersistedImport {
+  if (!isRecord(value)) {
+    throw new Error('Persisted import must be an object.');
+  }
+  return {
+    destinationDir: readString(value.destinationDir, 'destinationDir'),
+    packageName: readString(value.packageName, 'packageName'),
+  };
+}
+
+function sortImports(imports: PersistedImport[]): PersistedImport[] {
+  return [...imports].sort((a, b) => {
+    const packageOrder = a.packageName.localeCompare(b.packageName);
+    if (packageOrder !== 0) {
+      return packageOrder;
+    }
+    return a.destinationDir.localeCompare(b.destinationDir);
+  });
 }
 
 async function loadProject(projectDir: string): Promise<{ debounceMs: number; packages: ResolvedLivePackage[] }> {
@@ -294,6 +391,10 @@ function readRecord(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 function readString(value: unknown, label: string): string {
   if (typeof value !== 'string' || value.trim() === '') {
     throw new Error(`${label} must be a non-empty string.`);
@@ -309,6 +410,15 @@ function sendJson(response: ServerResponse, statusCode: number, body: unknown): 
 
 function packageStagingDir(projectDir: string, packageName: string): string {
   return path.join(projectDir, liveDirName, storeDirName, encodeURIComponent(packageName));
+}
+
+async function exists(file: string): Promise<boolean> {
+  try {
+    await access(file);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function runtimeKey(projectDir: string, packageName: string): string {

@@ -39,6 +39,7 @@ live-npm integrate
 - `.live-npm/pnpm-hooks.cjs`
 - `.live-npm/pnpmfile.cjs`
 - `.live-npm/config.yaml`
+- `.live-npm/state.json` after pnpm imports live packages
 - `.live-npm/pnpmfile-snippet.cjs` when a root pnpmfile already exists
 
 Add `.live-npm/` to the consuming project's `.gitignore` unless you intentionally want to share local integration files.
@@ -73,6 +74,12 @@ Start the local server:
 
 ```powershell
 live-npm start
+```
+
+`start` restores `.live-npm/state.json` from the current directory by default, so restarting the server reconnects previously imported package directories without another install. When starting from a different directory, pass one or more projects explicitly:
+
+```powershell
+live-npm start --project path/to/consumer-project
 ```
 
 Use `live:` specs in the consuming project:

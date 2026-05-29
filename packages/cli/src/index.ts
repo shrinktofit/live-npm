@@ -28,11 +28,17 @@ export async function runCli(args: string[]): Promise<void> {
         type: 'number',
         default: 8456,
         describe: 'Server port',
+      })
+      .option('project', {
+        type: 'string',
+        array: true,
+        describe: 'Project directory whose .live-npm/state.json should be restored',
       }), async (argv) => {
       const server = await startLiveNpmServer({
         host: argv.host,
         logger: consoleLogger,
         port: argv.port,
+        projectDirs: argv.project?.length ? argv.project : [process.cwd()],
       });
       await waitForClose(async () => {
         await server.close();
