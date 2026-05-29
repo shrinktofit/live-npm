@@ -2,8 +2,12 @@ import chokidar, { type FSWatcher } from 'chokidar';
 import path from 'node:path';
 import { readManifest, getWatchPaths } from './package-plan.js';
 import { publishPackage } from './publisher.js';
-import type { LiveNpmPackageConfig } from './config.js';
+import type { ResolvedLivePackage } from './workspace.js';
 import type { Logger } from './logger.js';
+
+export interface WatchPackageConfig extends ResolvedLivePackage {
+  target: string;
+}
 
 export interface WatchOptions {
   debounceMs: number;
@@ -15,7 +19,7 @@ export interface LiveWatcher {
   close(): Promise<void>;
 }
 
-export async function watchPackages(packages: LiveNpmPackageConfig[], options: WatchOptions): Promise<LiveWatcher> {
+export async function watchPackages(packages: WatchPackageConfig[], options: WatchOptions): Promise<LiveWatcher> {
   const watchers: FSWatcher[] = [];
 
   for (const packageConfig of packages) {

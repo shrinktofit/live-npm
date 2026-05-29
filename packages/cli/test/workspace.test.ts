@@ -15,11 +15,10 @@ describe('resolveWorkspacePackageConfigs', () => {
     const configs = await resolveWorkspacePackageConfigs({
       includes: ['package-a'],
       path: root,
-      target,
     });
 
     expect(configs.map((config) => path.basename(config.source)).sort()).toEqual(['a', 'b', 'c', 'peer']);
-    expect(configs.map((config) => config.target).sort()).toEqual([
+    expect(configs.map((config) => packageTargetPath(target, config.name)).sort()).toEqual([
       path.join(target, 'package-a'),
       path.join(target, 'package-b'),
       path.join(target, 'package-c'),
@@ -27,7 +26,7 @@ describe('resolveWorkspacePackageConfigs', () => {
     ]);
 
     for (const config of configs) {
-      await publishPackage(config.source, config.target, {
+      await publishPackage(config.source, packageTargetPath(target, config.name), {
         dryRun: false,
         logger: silentLogger,
         ...(config.manifestRewrite ? { manifestRewrite: config.manifestRewrite } : {}),
@@ -36,9 +35,12 @@ describe('resolveWorkspacePackageConfigs', () => {
 
     await expect(readPackageJson(path.join(target, 'package-a'))).resolves.toMatchObject({
       dependencies: {
-        'package-b': '1.2.0',
-        'package-c': '^1.3.0',
+        'package-b': 'live:package-b',
+        'package-c': 'live:package-c',
         'react': '^18.3.0',
+      },
+      peerDependencies: {
+        'package-peer': '^1.5.0',
       },
     });
   });
@@ -52,10 +54,13 @@ describe('resolveWorkspacePackageConfigs', () => {
     await expect(resolveWorkspacePackageConfigs({
       includes: ['package-a'],
       path: root,
-      target: path.join(root, 'published', 'node_modules'),
     })).rejects.toThrow('supports pnpm only');
   });
 });
+
+function packageTargetPath(targetRoot: string, packageName: string): string {
+  return path.join(targetRoot, ...packageName.split('/'));
+}
 
 async function writeWorkspace(root: string): Promise<void> {
   await writeFile(path.join(root, 'package.json'), JSON.stringify({

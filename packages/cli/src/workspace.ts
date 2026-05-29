@@ -1,19 +1,33 @@
-import path from 'node:path';
 import type { LiveNpmPackageConfig, LiveNpmWorkspaceConfig } from './config.js';
 import { pnpmWorkspaceDriver } from './pnpm-workspace-driver.js';
 import { detectWorkspaceManager, type SupportedWorkspaceManager } from './workspace-detection.js';
 import type { WorkspaceDriver, WorkspacePackage } from './workspace-driver.js';
-import type { PackageManifest } from './package-plan.js';
+import { readManifest, type PackageManifest } from './package-plan.js';
 
 const workspaceDrivers: Record<SupportedWorkspaceManager, WorkspaceDriver> = {
   pnpm: pnpmWorkspaceDriver,
 };
 
+export interface ResolvedLivePackage {
+  extraWatchPaths?: string[];
+  manifestRewrite?: LiveNpmPackageConfig['manifestRewrite'];
+  name: string;
+  source: string;
+}
+
 export async function resolveConfiguredPackages(
   packages: LiveNpmPackageConfig[],
   workspaces: LiveNpmWorkspaceConfig[],
-): Promise<LiveNpmPackageConfig[]> {
-  const resolvedPackages = [...packages];
+): Promise<ResolvedLivePackage[]> {
+  const resolvedPackages: ResolvedLivePackage[] = await Promise.all(packages.map(async (packageConfig) => {
+    const manifest = await readManifest(packageConfig.source);
+    return {
+      ...(packageConfig.extraWatchPaths ? { extraWatchPaths: packageConfig.extraWatchPaths } : {}),
+      ...(packageConfig.manifestRewrite ? { manifestRewrite: packageConfig.manifestRewrite } : {}),
+      name: readPackageName(manifest, packageConfig.source),
+      source: packageConfig.source,
+    };
+  }));
   for (const workspaceConfig of workspaces) {
     resolvedPackages.push(...await resolveWorkspacePackageConfigs(workspaceConfig));
   }
@@ -22,7 +36,7 @@ export async function resolveConfiguredPackages(
 
 export async function resolveWorkspacePackageConfigs(
   workspaceConfig: LiveNpmWorkspaceConfig,
-): Promise<LiveNpmPackageConfig[]> {
+): Promise<ResolvedLivePackage[]> {
   const driver = await resolveWorkspaceDriver(workspaceConfig.path);
   const packages = await driver.listPackages(workspaceConfig.path);
   const packageByName = new Map(packages.map((workspacePackage) => [workspacePackage.name, workspacePackage]));
@@ -54,10 +68,11 @@ export async function resolveWorkspacePackageConfigs(
       extraWatchPaths,
       manifestRewrite: {
         catalogs,
+        liveDependencyNames: selectedNames,
         workspaceVersions,
       },
+      name: workspacePackage.name,
       source: workspacePackage.path,
-      target: packageTargetPath(workspaceConfig.target, workspacePackage.name),
     };
   });
 }
@@ -120,8 +135,11 @@ function readWorkspaceDependencyNames(
   return [...dependencyNames];
 }
 
-function packageTargetPath(targetRoot: string, packageName: string): string {
-  return path.join(targetRoot, ...packageName.split('/'));
+function readPackageName(manifest: PackageManifest, source: string): string {
+  if (typeof manifest.name === 'string' && manifest.name.length > 0) {
+    return manifest.name;
+  }
+  return source;
 }
 
 function isStringRecord(value: unknown): value is Record<string, string> {

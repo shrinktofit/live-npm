@@ -20,7 +20,7 @@ export function rewritePublishManifest(manifest: PackageManifest, config: Manife
     next[field] = Object.fromEntries(
       Object.entries(dependencies).map(([dependencyName, spec]) => [
         dependencyName,
-        rewriteDependencySpec(dependencyName, spec, config, 0),
+        rewriteDependencySpec(dependencyName, spec, config, field, 0),
       ]),
     );
   }
@@ -32,10 +32,15 @@ function rewriteDependencySpec(
   dependencyName: string,
   spec: string,
   config: ManifestRewriteConfig,
+  field: typeof dependencyFields[number],
   depth: number,
 ): string {
   if (depth > 4) {
     throw new Error(`Could not resolve recursive dependency protocol for ${dependencyName}: ${spec}`);
+  }
+
+  if (shouldUseLiveDependency(dependencyName, field, config)) {
+    return `live:${dependencyName}`;
   }
 
   if (spec.startsWith('workspace:')) {
@@ -44,10 +49,21 @@ function rewriteDependencySpec(
 
   if (spec.startsWith('catalog:')) {
     const catalogSpec = readCatalogSpec(dependencyName, spec, config.catalogs);
-    return rewriteDependencySpec(dependencyName, catalogSpec, config, depth + 1);
+    return rewriteDependencySpec(dependencyName, catalogSpec, config, field, depth + 1);
   }
 
   return spec;
+}
+
+function shouldUseLiveDependency(
+  dependencyName: string,
+  field: typeof dependencyFields[number],
+  config: ManifestRewriteConfig,
+): boolean {
+  if (field !== 'dependencies' && field !== 'optionalDependencies') {
+    return false;
+  }
+  return config.liveDependencyNames?.includes(dependencyName) ?? false;
 }
 
 function rewriteWorkspaceSpec(

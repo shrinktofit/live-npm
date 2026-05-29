@@ -6,7 +6,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { runCli } from '../src/index.js';
 
 describe('runCli', () => {
-  it('uses live-npm.yaml from process.cwd when config is omitted', async () => {
+  it('uses .live-npm/config.yaml from process.cwd when config is omitted', async () => {
     const root = await makeTempDir();
     const source = path.join(root, 'source');
     const target = path.join(root, 'target');
@@ -17,10 +17,10 @@ describe('runCli', () => {
       files: ['lib'],
     }, null, 2));
     await writeFile(path.join(source, 'lib/index.js'), 'export const value = 1;\n');
-    await writeFile(path.join(root, 'live-npm.yaml'), [
+    await mkdir(path.join(root, '.live-npm'), { recursive: true });
+    await writeFile(path.join(root, '.live-npm/config.yaml'), [
       'packages:',
-      '  - source: ./source',
-      '    target: ./target',
+      '  - source: ../source',
       '',
     ].join('\n'));
 
@@ -28,13 +28,13 @@ describe('runCli', () => {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
     try {
       process.chdir(root);
-      await runCli(['--once']);
+      await runCli(['once', './target']);
     } finally {
       process.chdir(previousCwd);
       logSpy.mockRestore();
     }
 
-    await expect(readFile(path.join(target, 'lib/index.js'), 'utf8')).resolves.toContain('value = 1');
+    await expect(readFile(path.join(target, 'sample-package/lib/index.js'), 'utf8')).resolves.toContain('value = 1');
   });
 });
 

@@ -12,7 +12,6 @@ describe('loadConfig', () => {
       'debounceMs: 25',
       'packages:',
       '  - source: ./packages/a',
-      '    target: ./published/a',
       '',
     ].join('\n'));
 
@@ -24,7 +23,6 @@ describe('loadConfig', () => {
       packages: [
         {
           source: path.join(root, 'packages/a'),
-          target: path.join(root, 'published/a'),
         },
       ],
       workspaces: [],
@@ -40,7 +38,6 @@ describe('loadConfig', () => {
       '    includes:',
       '      - package-a',
       '      - package-b',
-      '    target: ./published/node_modules',
       '',
     ].join('\n'));
 
@@ -53,7 +50,6 @@ describe('loadConfig', () => {
         {
           includes: ['package-a', 'package-b'],
           path: path.join(root, 'workspace'),
-          target: path.join(root, 'published/node_modules'),
         },
       ],
     });

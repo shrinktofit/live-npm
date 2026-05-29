@@ -12,17 +12,16 @@ export interface LiveNpmPackageConfig {
   extraWatchPaths?: string[];
   manifestRewrite?: ManifestRewriteConfig;
   source: string;
-  target: string;
 }
 
 export interface LiveNpmWorkspaceConfig {
   includes: string[];
   path: string;
-  target: string;
 }
 
 export interface ManifestRewriteConfig {
   catalogs: CatalogRewriteConfig;
+  liveDependencyNames?: string[];
   workspaceVersions: Record<string, string>;
 }
 
@@ -67,8 +66,7 @@ function readPackageConfig(data: unknown, index: number, configDir: string): Liv
   }
 
   const source = readPath(data.source, `packages[${index}].source`, configDir);
-  const target = readPath(data.target, `packages[${index}].target`, configDir);
-  return { source, target };
+  return { source };
 }
 
 function readWorkspaceConfig(data: unknown, index: number, configDir: string): LiveNpmWorkspaceConfig {
@@ -77,13 +75,12 @@ function readWorkspaceConfig(data: unknown, index: number, configDir: string): L
   }
 
   const workspacePath = readPath(data.path, `workspaces[${index}].path`, configDir);
-  const target = readPath(data.target, `workspaces[${index}].target`, configDir);
   const includes = readStringArray(data.includes, `workspaces[${index}].includes`);
   if (includes.length === 0) {
     throw new Error(`workspaces[${index}].includes must not be empty.`);
   }
 
-  return { includes, path: workspacePath, target };
+  return { includes, path: workspacePath };
 }
 
 function readPath(value: unknown, label: string, baseDir: string): string {
