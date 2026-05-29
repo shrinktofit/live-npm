@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.json",
+  "include": [
+    "src"
+  ],
+  "compilerOptions": {
+    "declaration": true,
+    "rootDir": "src",
+    "outDir": "lib",
+    "types": [
+      "node",
+      "vitest/globals"
+    ]
+  }
+}

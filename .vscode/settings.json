@@ -1,0 +1,16 @@
+{
+  "npm.packageManager": "pnpm",
+  "eslint.validate": [
+    "javascript",
+    "typescript"
+  ],
+  "editor.codeActionsOnSave": {
+    "source.fixAll.eslint": "explicit"
+  },
+  "eslint.workingDirectories": [
+    { "mode": "auto" }
+  ],
+  "js/ts.preferences.importModuleSpecifierEnding": "js",
+  "js/ts.preferences.quoteStyle": "single",
+  "js/ts.tsdk.path": "node_modules/typescript/lib"
+}
