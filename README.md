@@ -93,17 +93,6 @@ pnpm install
 
 During install, pnpm asks live-npm to resolve and fetch `live:` packages. After import, live-npm records the actual installed package directory and keeps it updated while the server is running.
 
-## Legacy Target Commands
-
-The old direct-copy workflow is still available for debugging:
-
-```powershell
-live-npm once ./node_modules
-live-npm watch ./node_modules
-```
-
-These commands read `.live-npm/config.yaml` and publish each selected package into a target `node_modules`-style root.
-
 ## Notes
 
 `live-npm` keeps package files live after install, including file additions, modifications, deletions, and rewritten `package.json` content.
