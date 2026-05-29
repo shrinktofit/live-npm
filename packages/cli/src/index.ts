@@ -26,8 +26,8 @@ export async function runCli(args: string[]): Promise<void> {
       })
       .option('port', {
         type: 'number',
-        default: 8456,
-        describe: 'Server port',
+        default: 0,
+        describe: 'Server port. Defaults to the previous project port, or any available port.',
       })
       .option('project', {
         type: 'string',
@@ -45,23 +45,17 @@ export async function runCli(args: string[]): Promise<void> {
       });
     })
     .command('integrate', 'Generate pnpm hook files for the current project', (command) => command
-      .option('host', {
-        type: 'string',
-        default: '127.0.0.1',
-        describe: 'Default server host written into .live-npm/pnpm-hooks.cjs',
-      })
-      .option('port', {
-        type: 'number',
-        default: 8456,
-        describe: 'Default server port written into .live-npm/pnpm-hooks.cjs',
-      }), async (argv) => {
+      .strict(), async () => {
       const result = await integrateProject({
-        host: argv.host,
-        port: argv.port,
         projectDir: process.cwd(),
       });
       consoleLogger.info(`wrote ${path.join(result.liveDir, 'pnpm-hooks.cjs')}`);
       consoleLogger.info(`wrote ${path.join(result.liveDir, 'pnpmfile.cjs')}`);
+      if (result.configCreated) {
+        consoleLogger.info(`wrote ${result.configPath}`);
+      } else {
+        consoleLogger.info(`kept existing ${result.configPath}`);
+      }
       if (result.createdRootPnpmfile && result.rootPnpmfilePath) {
         consoleLogger.info(`wrote ${result.rootPnpmfilePath}`);
       } else if (result.rootPnpmfilePath && result.snippetPath) {

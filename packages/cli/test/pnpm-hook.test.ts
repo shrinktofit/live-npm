@@ -34,11 +34,9 @@ describe('generated pnpm hooks', () => {
       host: '127.0.0.1',
       logger: silentLogger,
       port: 0,
+      projectDirs: [root],
     });
-    const serverUrl = new URL(server.url);
     await integrateProject({
-      host: serverUrl.hostname,
-      port: Number(serverUrl.port),
       projectDir: root,
     });
     await writeFile(path.join(root, '.live-npm/config.yaml'), [

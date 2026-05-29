@@ -1,41 +1,67 @@
-export interface PnpmHookTemplateOptions {
-  defaultHost: string;
-  defaultPort: number;
-}
-
-export function createPnpmHooksCjs(options: PnpmHookTemplateOptions): string {
+export function createPnpmHooksCjs(): string {
   return `const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
 
 const prefix = 'live:';
 const resolutionType = 'custom:live-npm';
-const defaultHost = ${JSON.stringify(options.defaultHost)};
-const defaultPort = ${JSON.stringify(options.defaultPort)};
 
 function projectDirFromOptions(options) {
   return path.resolve(options.lockfileDir || options.projectDir || process.cwd());
 }
 
-function serverAddress() {
+function serverAddress(projectDir) {
+  const overrideUrl = process.env.LIVE_NPM_URL;
+  const overrideToken = process.env.LIVE_NPM_TOKEN;
+  if (overrideUrl) {
+    return readAddress(overrideUrl, overrideToken || '');
+  }
+
+  const serverFile = path.join(projectDir, '.live-npm', 'server.json');
+  let serverState;
+  try {
+    serverState = JSON.parse(fs.readFileSync(serverFile, 'utf8'));
+  } catch (error) {
+    throw new Error(\`Could not read \${serverFile}. Start live-npm for this project before running pnpm install.\`);
+  }
+  if (!serverState || serverState.version !== 1 || typeof serverState.url !== 'string' || typeof serverState.token !== 'string') {
+    throw new Error(\`\${serverFile} is not a valid live-npm server file.\`);
+  }
+  return readAddress(serverState.url, serverState.token);
+}
+
+function readAddress(urlText, token) {
+  const url = new URL(urlText);
+  const port = Number(url.port);
+  if (!Number.isInteger(port) || port <= 0) {
+    throw new Error(\`live-npm server URL must include a port: \${urlText}\`);
+  }
   return {
-    host: process.env.LIVE_NPM_HOST || defaultHost,
-    port: Number(process.env.LIVE_NPM_PORT || defaultPort),
+    host: url.hostname,
+    pathPrefix: url.pathname === '/' ? '' : url.pathname.replace(/\\/$/, ''),
+    port,
+    protocol: url.protocol,
+    token,
   };
 }
 
-function postJson(pathname, body) {
-  const address = serverAddress();
+function postJson(pathname, body, projectDir) {
+  const address = serverAddress(projectDir);
   const payload = Buffer.from(JSON.stringify(body));
   return new Promise((resolve, reject) => {
+    if (address.protocol !== 'http:') {
+      reject(new Error(\`Unsupported live-npm server protocol: \${address.protocol}\`));
+      return;
+    }
     const request = http.request({
       host: address.host,
       method: 'POST',
-      path: pathname,
+      path: \`\${address.pathPrefix}\${pathname}\`,
       port: address.port,
       headers: {
         'content-length': String(payload.byteLength),
         'content-type': 'application/json',
+        'x-live-npm-token': address.token,
       },
     }, (response) => {
       const chunks = [];
@@ -86,10 +112,11 @@ const resolver = {
       throw new Error('live-npm resolver received a non-live dependency.');
     }
 
+    const projectDir = projectDirFromOptions(options);
     const result = await postJson('/resolve', {
       packageName,
-      projectDir: projectDirFromOptions(options),
-    });
+      projectDir,
+    }, projectDir);
     const version = normalizeVersion(result.manifest);
 
     return {
@@ -116,10 +143,11 @@ const fetcher = {
   },
 
   async fetch(_cafs, resolution, options) {
+    const projectDir = projectDirFromOptions(options);
     const result = await postJson('/fetch', {
       packageName: resolution.packageName,
-      projectDir: projectDirFromOptions(options),
-    });
+      projectDir,
+    }, projectDir);
     const filesMap = await listFilesMap(result.stagingDir);
     return {
       filesMap,
@@ -139,7 +167,7 @@ async function importPackage(destinationDir, options) {
       destinationDir,
       packageName: liveInfo.packageName,
       projectDir: liveInfo.projectDir,
-    });
+    }, liveInfo.projectDir);
   }
   return 'copy';
 }

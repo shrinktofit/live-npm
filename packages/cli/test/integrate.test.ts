@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -10,12 +10,11 @@ describe('integrateProject', () => {
     await writePackageJson(root);
 
     const result = await integrateProject({
-      host: '127.0.0.1',
-      port: 8456,
       projectDir: root,
     });
 
     expect(result.createdRootPnpmfile).toBe(true);
+    expect(result.configCreated).toBe(true);
     await expect(readFile(path.join(root, '.live-npm/pnpm-hooks.cjs'), 'utf8')).resolves.toContain('custom:live-npm');
     await expect(readFile(path.join(root, '.live-npm/pnpmfile.cjs'), 'utf8')).resolves.toContain('importPackage');
     await expect(readFile(path.join(root, '.live-npm/config.yaml'), 'utf8')).resolves.toContain('packages: []');
@@ -28,14 +27,26 @@ describe('integrateProject', () => {
     await writeFile(path.join(root, '.pnpmfile.cjs'), 'module.exports = { hooks: {} };\n');
 
     const result = await integrateProject({
-      host: '127.0.0.1',
-      port: 8456,
       projectDir: root,
     });
 
     expect(result.createdRootPnpmfile).toBe(false);
     await expect(readFile(path.join(root, '.pnpmfile.cjs'), 'utf8')).resolves.toBe('module.exports = { hooks: {} };\n');
     await expect(readFile(path.join(root, '.live-npm/pnpmfile-snippet.cjs'), 'utf8')).resolves.toContain('.live-npm/pnpm-hooks.cjs');
+  });
+
+  it('keeps an existing config file', async () => {
+    const root = await makeTempDir();
+    await writePackageJson(root);
+    await mkdir(path.join(root, '.live-npm'), { recursive: true });
+    await writeFile(path.join(root, '.live-npm/config.yaml'), 'packages:\n  - source: ../source\n');
+
+    const result = await integrateProject({
+      projectDir: root,
+    });
+
+    expect(result.configCreated).toBe(false);
+    await expect(readFile(path.join(root, '.live-npm/config.yaml'), 'utf8')).resolves.toBe('packages:\n  - source: ../source\n');
   });
 });
 

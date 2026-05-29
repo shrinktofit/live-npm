@@ -40,7 +40,10 @@ live-npm integrate
 - `.live-npm/pnpmfile.cjs`
 - `.live-npm/config.yaml`
 - `.live-npm/state.json` after pnpm imports live packages
+- `.live-npm/server.json` while a project server is running
 - `.live-npm/pnpmfile-snippet.cjs` when a root pnpmfile already exists
+
+If `.live-npm/config.yaml` already exists, `integrate` keeps it unchanged.
 
 Add `.live-npm/` to the consuming project's `.gitignore` unless you intentionally want to share local integration files.
 
@@ -76,11 +79,17 @@ Start the local server:
 live-npm start
 ```
 
-`start` restores `.live-npm/state.json` from the current directory by default, so restarting the server reconnects previously imported package directories without another install. When starting from a different directory, pass one or more projects explicitly:
+`start` restores `.live-npm/state.json` from the current directory by default, so restarting the server reconnects previously imported package directories without another install. It also writes `.live-npm/server.json` with the current local endpoint and a token; pnpm hooks read that file on every request, so projects do not share a fixed port.
+
+By default, `start` tries the previous project port recorded in `.live-npm/server.json`. If that port is unavailable, it selects a new available port, rewrites `server.json`, and keeps going. Reinstalling is not required just because the port changed.
+
+When starting from a different directory, pass one or more projects explicitly:
 
 ```powershell
 live-npm start --project path/to/consumer-project
 ```
+
+If a project has `.live-npm/config.yaml` but no `.live-npm/state.json`, `start` prints a warning. Run `pnpm install` once while the server is running so pnpm can register live package import targets.
 
 Use `live:` specs in the consuming project:
 
