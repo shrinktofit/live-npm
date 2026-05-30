@@ -18,6 +18,7 @@ describe('resolveWorkspacePackageConfigs', () => {
     });
 
     expect(configs.map((config) => path.basename(config.source)).sort()).toEqual(['a', 'b', 'c', 'peer']);
+    expect([...new Set(configs.map((config) => config.watchGroup.key))]).toEqual([`workspace:${root}`]);
     expect(configs.map((config) => packageTargetPath(target, config.name)).sort()).toEqual([
       path.join(target, 'package-a'),
       path.join(target, 'package-b'),

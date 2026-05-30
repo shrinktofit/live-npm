@@ -55,10 +55,34 @@ interface RegisterImportRequest {
 interface RuntimePackage {
   config: ResolvedLivePackage;
   debounceMs: number;
+  lastError?: string;
+  lastPublishAt?: string;
   projectDir: string;
   targets: Set<string>;
+}
+
+interface WatchGroup {
+  debounceMs: number;
+  kind: ResolvedLivePackage['watchGroup']['kind'];
+  key: string;
+  lastError?: string;
+  lastEvent?: WatchEventStatus;
+  metadataPaths: string[];
+  pendingForceRewatch: boolean;
+  pendingRuntimes: Set<RuntimePackage>;
+  projectDir: string;
+  root: string;
+  runtimes: Set<RuntimePackage>;
   watcher?: FSWatcher;
   watchPaths?: string[];
+}
+
+interface WatchEventStatus {
+  at: string;
+  event: string;
+  packageNames: string[];
+  path: string;
+  relativePath: string;
 }
 
 interface PersistedServer {
@@ -156,6 +180,7 @@ class LiveNpmServerManager {
   private readonly logger: Logger;
   private readonly runtimes = new Map<string, RuntimePackage>();
   private readonly token: string;
+  private readonly watchGroups = new Map<string, WatchGroup>();
 
   constructor(logger: Logger, token: string) {
     this.logger = logger;
@@ -223,7 +248,38 @@ class LiveNpmServerManager {
   }
 
   async close(): Promise<void> {
-    await Promise.all([...this.runtimes.values()].map(async (runtime) => runtime.watcher?.close()));
+    await Promise.all([...this.watchGroups.values()].map(async (group) => group.watcher?.close()));
+  }
+
+  status(): unknown {
+    return {
+      pid: process.pid,
+      projects: [...new Set([...this.runtimes.values()].map((runtime) => runtime.projectDir))].sort(),
+      watchGroups: [...this.watchGroups.values()].map((group) => {
+        const watched = group.watcher?.getWatched() ?? {};
+        return {
+          key: group.key,
+          kind: group.kind,
+          lastError: group.lastError,
+          lastEvent: group.lastEvent,
+          packages: [...group.runtimes].map((runtime) => runtime.config.name).sort(),
+          projectDir: group.projectDir,
+          root: group.root,
+          watchedDirs: Object.keys(watched).length,
+          watchedEntries: Object.values(watched).reduce((sum, entries) => sum + entries.length, 0),
+          watchPaths: group.watchPaths ?? [],
+        };
+      }).sort((left, right) => left.key.localeCompare(right.key)),
+      packages: [...this.runtimes.values()].map((runtime) => ({
+        lastError: runtime.lastError,
+        lastPublishAt: runtime.lastPublishAt,
+        name: runtime.config.name,
+        projectDir: runtime.projectDir,
+        source: runtime.config.source,
+        targets: [...runtime.targets].sort(),
+        watchGroupKey: runtime.config.watchGroup.key,
+      })).sort((left, right) => left.name.localeCompare(right.name)),
+    };
   }
 
   private async ensureRuntime(projectDir: string, packageName: string): Promise<RuntimePackage> {
@@ -247,79 +303,179 @@ class LiveNpmServerManager {
       targets: new Set([packageStagingDir(resolvedProjectDir, config.name)]),
     };
     this.runtimes.set(key, runtime);
-    await this.startWatcher(runtime);
+    await this.startRuntime(runtime);
     return runtime;
   }
 
-  private async startWatcher(runtime: RuntimePackage): Promise<void> {
+  private async startRuntime(runtime: RuntimePackage): Promise<void> {
     await this.publishRuntime(runtime);
-    await this.replaceWatcher(runtime);
+    await this.registerRuntimeWatcher(runtime);
   }
 
-  private async replaceWatcher(runtime: RuntimePackage, force = false): Promise<void> {
-    const manifest = await readManifest(runtime.config.source);
-    const watchPaths = [
-      ...getWatchPaths(runtime.config.source, manifest),
-      ...(runtime.config.extraWatchPaths ?? []),
-    ];
-    if (!force && runtime.watcher && runtime.watchPaths && areSameWatchPaths(runtime.watchPaths, watchPaths)) {
+  private async registerRuntimeWatcher(runtime: RuntimePackage): Promise<void> {
+    const groupKey = watchGroupRuntimeKey(runtime.projectDir, runtime.config.watchGroup.key);
+    let group = this.watchGroups.get(groupKey);
+    if (!group) {
+      group = {
+        debounceMs: runtime.debounceMs,
+        key: runtime.config.watchGroup.key,
+        kind: runtime.config.watchGroup.kind,
+        metadataPaths: [],
+        pendingForceRewatch: false,
+        pendingRuntimes: new Set(),
+        projectDir: runtime.projectDir,
+        root: runtime.config.watchGroup.root,
+        runtimes: new Set(),
+      };
+      this.watchGroups.set(groupKey, group);
+    }
+
+    group.runtimes.add(runtime);
+    await this.replaceWatchGroup(group);
+  }
+
+  private async replaceWatchGroup(group: WatchGroup, force = false): Promise<void> {
+    const plan = await this.createWatchGroupPlan(group);
+    if (!force && group.watcher && group.watchPaths && areSameWatchPaths(group.watchPaths, plan.watchPaths)) {
       return;
     }
 
-    await runtime.watcher?.close();
-    delete runtime.watcher;
-    runtime.watchPaths = watchPaths;
+    await group.watcher?.close();
+    delete group.watcher;
+    group.watchPaths = plan.watchPaths;
+    group.metadataPaths = plan.metadataPaths;
 
     const schedule = debounce(async () => {
       try {
-        await this.publishRuntime(runtime);
+        const pendingRuntimes = [...group.pendingRuntimes];
+        group.pendingRuntimes.clear();
+        const pendingForceRewatch = group.pendingForceRewatch;
+        group.pendingForceRewatch = false;
+        await Promise.all(pendingRuntimes.map(async (runtime) => {
+          await this.publishRuntime(runtime);
+        }));
+        if (pendingForceRewatch) {
+          await this.replaceWatchGroup(group, true);
+        }
       } catch (error) {
+        group.lastError = formatErrorMessage(error);
         this.logger.error(formatUnknownError(error));
       }
-    }, runtime.debounceMs);
-    const scheduleRewatch = debounce(async () => {
-      try {
-        await this.publishRuntime(runtime);
-        await this.replaceWatcher(runtime, true);
-      } catch (error) {
-        this.logger.error(formatUnknownError(error));
-      }
-    }, runtime.debounceMs);
-    const ignored = createPublishWatchIgnored(runtime.config.source, manifest);
+    }, group.debounceMs);
 
-    const watcher = chokidar.watch(watchPaths, {
+    const watcher = chokidar.watch(plan.watchPaths, {
       awaitWriteFinish: {
         pollInterval: 50,
         stabilityThreshold: 150,
       },
       ignoreInitial: true,
-      ignored,
+      ignored: plan.ignored,
     });
 
     watcher.on('all', (event, changedPath) => {
-      this.logger.debug(`${event} ${path.relative(runtime.config.source, changedPath)}`);
-      if (path.resolve(changedPath) === path.join(path.resolve(runtime.config.source), 'package.json')) {
-        scheduleRewatch();
-        return;
+      const affectedRuntimes = this.getAffectedRuntimes(group, changedPath);
+      group.lastEvent = {
+        at: new Date().toISOString(),
+        event,
+        packageNames: affectedRuntimes.map((runtime) => runtime.config.name).sort(),
+        path: path.resolve(changedPath),
+        relativePath: path.relative(group.root, changedPath),
+      };
+      this.logger.debug(`${event} ${path.relative(group.root, changedPath)}`);
+      for (const runtime of affectedRuntimes) {
+        group.pendingRuntimes.add(runtime);
+        if (isRuntimePackageJson(runtime, changedPath)) {
+          group.pendingForceRewatch = true;
+        }
       }
       schedule();
     });
     watcher.on('error', (error) => {
+      group.lastError = formatErrorMessage(error);
       this.logger.error(formatUnknownError(error));
     });
 
-    runtime.watcher = watcher;
-    this.logger.info(`watching ${runtime.config.name} from ${runtime.config.source}`);
+    group.watcher = watcher;
+    delete group.lastError;
+    this.logger.info(`watching ${group.kind} ${group.root} for ${group.runtimes.size} package(s)`);
+  }
+
+  private async createWatchGroupPlan(group: WatchGroup): Promise<{
+    ignored: (watchPath: string) => boolean;
+    metadataPaths: string[];
+    watchPaths: string[];
+  }> {
+    const watchPaths: string[] = [];
+    const packageRules: {
+      ignored: (watchPath: string) => boolean;
+      runtime: RuntimePackage;
+      source: string;
+    }[] = [];
+    const metadataPaths: string[] = [];
+
+    for (const runtime of group.runtimes) {
+      const manifest = await readManifest(runtime.config.source);
+      packageRules.push({
+        ignored: createPublishWatchIgnored(runtime.config.source, manifest),
+        runtime,
+        source: path.resolve(runtime.config.source),
+      });
+      for (const watchPath of getWatchPaths(runtime.config.source, manifest)) {
+        addFoldedWatchPath(watchPaths, watchPath);
+      }
+      for (const watchPath of runtime.config.extraWatchPaths ?? []) {
+        addFoldedWatchPath(watchPaths, watchPath);
+        metadataPaths.push(path.resolve(watchPath));
+      }
+    }
+
+    return {
+      ignored(watchPath) {
+        const resolvedWatchPath = path.resolve(watchPath);
+        if (metadataPaths.some((metadataPath) => isInsideOrSame(metadataPath, resolvedWatchPath))) {
+          return false;
+        }
+
+        const matchingPackageRules = packageRules.filter((rule) => isInsideOrSame(rule.source, resolvedWatchPath));
+        if (matchingPackageRules.length === 0) {
+          return true;
+        }
+
+        return matchingPackageRules.every((rule) => rule.ignored(resolvedWatchPath));
+      },
+      metadataPaths: [...new Set(metadataPaths)].sort(),
+      watchPaths,
+    };
+  }
+
+  private getAffectedRuntimes(group: WatchGroup, changedPath: string): RuntimePackage[] {
+    const resolvedChangedPath = path.resolve(changedPath);
+    if (group.metadataPaths.some((metadataPath) => isInsideOrSame(metadataPath, resolvedChangedPath))) {
+      return [...group.runtimes];
+    }
+
+    const affected = [...group.runtimes].filter((runtime) => isInsideOrSame(runtime.config.source, resolvedChangedPath));
+    if (affected.length > 0) {
+      return affected;
+    }
+    return [...group.runtimes];
   }
 
   private async publishRuntime(runtime: RuntimePackage): Promise<void> {
-    await Promise.all([...runtime.targets].map(async (target) => {
-      await publishPackage(runtime.config.source, target, {
-        dryRun: false,
-        logger: this.logger,
-        ...(runtime.config.manifestRewrite ? { manifestRewrite: runtime.config.manifestRewrite } : {}),
-      });
-    }));
+    try {
+      await Promise.all([...runtime.targets].map(async (target) => {
+        await publishPackage(runtime.config.source, target, {
+          dryRun: false,
+          logger: this.logger,
+          ...(runtime.config.manifestRewrite ? { manifestRewrite: runtime.config.manifestRewrite } : {}),
+        });
+      }));
+      runtime.lastPublishAt = new Date().toISOString();
+      delete runtime.lastError;
+    } catch (error) {
+      runtime.lastError = formatErrorMessage(error);
+      throw error;
+    }
   }
 
   private async writeState(projectDir: string): Promise<void> {
@@ -605,6 +761,14 @@ async function handleRequest(
       sendJson(response, 200, { ok: true });
       return;
     }
+    if (request.url === '/status') {
+      if (!manager.authenticate(request)) {
+        sendJson(response, 401, { error: 'Unauthorized.' });
+        return;
+      }
+      sendJson(response, 200, manager.status());
+      return;
+    }
 
     if (request.method !== 'POST') {
       sendJson(response, 405, { error: 'Method not allowed.' });
@@ -719,11 +883,42 @@ function runtimeKey(projectDir: string, packageName: string): string {
   return `${path.resolve(projectDir)}\0${packageName}`;
 }
 
+function watchGroupRuntimeKey(projectDir: string, watchGroupKey: string): string {
+  return `${path.resolve(projectDir)}\0${watchGroupKey}`;
+}
+
 function areSameWatchPaths(left: string[], right: string[]): boolean {
   if (left.length !== right.length) {
     return false;
   }
   return left.every((watchPath, index) => watchPath === right[index]);
+}
+
+function addFoldedWatchPath(paths: string[], watchPath: string): void {
+  const resolvedWatchPath = path.resolve(watchPath);
+
+  for (const existing of paths) {
+    if (isInsideOrSame(existing, resolvedWatchPath)) {
+      return;
+    }
+  }
+
+  for (let index = paths.length - 1; index >= 0; index -= 1) {
+    if (isInsideOrSame(resolvedWatchPath, paths[index])) {
+      paths.splice(index, 1);
+    }
+  }
+
+  paths.push(resolvedWatchPath);
+}
+
+function isInsideOrSame(parent: string, child: string): boolean {
+  const relative = path.relative(parent, child);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function isRuntimePackageJson(runtime: RuntimePackage, changedPath: string): boolean {
+  return path.resolve(changedPath) === path.join(path.resolve(runtime.config.source), 'package.json');
 }
 
 function debounce(callback: () => Promise<void>, delay: number): () => void {

@@ -94,6 +94,14 @@ live-npm start --project path/to/consumer-project
 
 If a project has `.live-npm/config.yaml` but no `.live-npm/state.json`, `start` prints a warning. Run `pnpm install` once while the server is running so pnpm can register live package import targets.
 
+Inspect the running project server from another terminal:
+
+```powershell
+live-npm status
+```
+
+`status` reads `.live-npm/server.json`, connects to the running local server, and prints active packages, watch groups, watch roots, watched directory counts, and last publish information. Use `live-npm status --json` for raw JSON.
+
 Use `live:` specs in the consuming project:
 
 ```json
@@ -137,3 +145,5 @@ live-npm start
 If a source package changes its dependency graph, run `pnpm install` again. live-npm cannot make pnpm install new dependencies after the install has already settled.
 
 For best performance, keep `package.json#files` focused on build outputs such as `lib` or `dist`. When `files` is declared, the watcher can focus on those publish entries plus package metadata. When `files` is omitted, `live-npm` falls back to watching the package root because npm may publish any non-ignored file.
+
+Direct `packages` entries use one watcher per source package. Packages selected from the same `workspaces` entry share one workspace watcher backend, then route events back to the affected package runtimes.

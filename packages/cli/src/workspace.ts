@@ -13,6 +13,13 @@ export interface ResolvedLivePackage {
   manifestRewrite?: LiveNpmPackageConfig['manifestRewrite'];
   name: string;
   source: string;
+  watchGroup: ResolvedWatchGroup;
+}
+
+export interface ResolvedWatchGroup {
+  kind: 'package' | 'workspace';
+  key: string;
+  root: string;
 }
 
 export async function resolveConfiguredPackages(
@@ -26,6 +33,11 @@ export async function resolveConfiguredPackages(
       ...(packageConfig.manifestRewrite ? { manifestRewrite: packageConfig.manifestRewrite } : {}),
       name: readPackageName(manifest, packageConfig.source),
       source: packageConfig.source,
+      watchGroup: {
+        kind: 'package',
+        key: `package:${packageConfig.source}`,
+        root: packageConfig.source,
+      },
     };
   }));
   for (const workspaceConfig of workspaces) {
@@ -73,6 +85,11 @@ export async function resolveWorkspacePackageConfigs(
       },
       name: workspacePackage.name,
       source: workspacePackage.path,
+      watchGroup: {
+        kind: 'workspace',
+        key: `workspace:${workspaceConfig.path}`,
+        root: workspaceConfig.path,
+      },
     };
   });
 }
