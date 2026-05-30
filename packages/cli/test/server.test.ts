@@ -87,6 +87,83 @@ describe('startLiveNpmServer', () => {
     });
   });
 
+  it('rebuilds package watchers when package.json publish files change', async () => {
+    const root = await makeTempDir();
+    const source = path.join(root, 'source');
+    const target = path.join(root, 'node_modules/.pnpm/live/node_modules/sample-package');
+    await writeSourcePackage(source, 'export const value = 1;\n', ['lib']);
+    await mkdir(path.join(root, '.live-npm'), { recursive: true });
+    await writeFile(path.join(root, '.live-npm/config.yaml'), [
+      'debounceMs: 25',
+      'packages:',
+      '  - source: ../source',
+      '',
+    ].join('\n'));
+
+    server = await startLiveNpmServer({
+      host: '127.0.0.1',
+      logger: silentLogger,
+      port: 0,
+      projectDirs: [root],
+    });
+
+    await postJson(server.url, '/register-import', {
+      destinationDir: target,
+      packageName: 'sample-package',
+      projectDir: root,
+    }, root);
+
+    await expect(readFile(path.join(target, 'lib/index.js'), 'utf8')).resolves.toContain('value = 1');
+
+    await mkdir(path.join(source, 'dist'), { recursive: true });
+    await writeFile(path.join(source, 'dist/index.js'), 'export const value = 2;\n');
+    await writeSourceManifest(source, ['dist/**']);
+
+    await waitFor(async () => {
+      await expect(readFile(path.join(target, 'dist/index.js'), 'utf8')).resolves.toContain('value = 2');
+      await expect(readFile(path.join(target, 'lib/index.js'), 'utf8')).rejects.toThrow();
+    });
+  });
+
+  it('refreshes ignored rules when package.json files changes without changing watch roots', async () => {
+    const root = await makeTempDir();
+    const source = path.join(root, 'source');
+    const target = path.join(root, 'node_modules/.pnpm/live/node_modules/sample-package');
+    await writeSourcePackage(source, 'export const value = 1;\n', ['lib/**']);
+    await writeFile(path.join(source, 'lib/index.js.map'), '{}\n');
+    await mkdir(path.join(root, '.live-npm'), { recursive: true });
+    await writeFile(path.join(root, '.live-npm/config.yaml'), [
+      'debounceMs: 25',
+      'packages:',
+      '  - source: ../source',
+      '',
+    ].join('\n'));
+
+    server = await startLiveNpmServer({
+      host: '127.0.0.1',
+      logger: silentLogger,
+      port: 0,
+      projectDirs: [root],
+    });
+
+    await postJson(server.url, '/register-import', {
+      destinationDir: target,
+      packageName: 'sample-package',
+      projectDir: root,
+    }, root);
+
+    await expect(readFile(path.join(target, 'lib/index.js.map'), 'utf8')).resolves.toContain('{}');
+    await writeSourceManifest(source, ['lib/**', '!lib/**/*.map']);
+    await waitFor(async () => {
+      await expect(readFile(path.join(target, 'lib/index.js.map'), 'utf8')).rejects.toThrow();
+    });
+
+    await writeFile(path.join(target, 'lib/index.js'), 'stale target\n');
+    await writeFile(path.join(source, 'lib/index.js.map'), '{"updated":true}\n');
+    await sleep(750);
+    await expect(readFile(path.join(target, 'lib/index.js'), 'utf8')).resolves.toContain('stale target');
+  });
+
   it('restores persisted import targets after server restart', async () => {
     const root = await makeTempDir();
     const source = path.join(root, 'source');
@@ -492,12 +569,16 @@ async function readServerState(root: string): Promise<ServerState> {
 
 async function writeSourcePackage(source: string, contents: string, files: string[] = ['lib']): Promise<void> {
   await mkdir(path.join(source, 'lib'), { recursive: true });
+  await writeSourceManifest(source, files);
+  await writeFile(path.join(source, 'lib/index.js'), contents);
+}
+
+async function writeSourceManifest(source: string, files: string[]): Promise<void> {
   await writeFile(path.join(source, 'package.json'), JSON.stringify({
     name: 'sample-package',
     version: '0.0.0',
     files,
   }, null, 2));
-  await writeFile(path.join(source, 'lib/index.js'), contents);
 }
 
 async function waitFor(assertion: () => Promise<void>): Promise<void> {
@@ -515,6 +596,12 @@ async function waitFor(assertion: () => Promise<void>): Promise<void> {
     }
   }
   throw lastError;
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 async function makeTempDir(): Promise<string> {

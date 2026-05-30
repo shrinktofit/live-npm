@@ -14,7 +14,7 @@ import { loadConfig } from './config.js';
 import { consoleLogger, type Logger } from './logger.js';
 import { currentIntegrationVersion, integrationPnpmfileMode, integrationVersionFileName } from './integration-version.js';
 import { rewritePublishManifest } from './manifest-rewrite.js';
-import { readManifest, getWatchPaths } from './package-plan.js';
+import { createPublishWatchIgnored, readManifest, getWatchPaths } from './package-plan.js';
 import { publishPackage } from './publisher.js';
 import { resolveConfiguredPackages, type ResolvedLivePackage } from './workspace.js';
 
@@ -58,6 +58,7 @@ interface RuntimePackage {
   projectDir: string;
   targets: Set<string>;
   watcher?: FSWatcher;
+  watchPaths?: string[];
 }
 
 interface PersistedServer {
@@ -252,11 +253,23 @@ class LiveNpmServerManager {
 
   private async startWatcher(runtime: RuntimePackage): Promise<void> {
     await this.publishRuntime(runtime);
+    await this.replaceWatcher(runtime);
+  }
+
+  private async replaceWatcher(runtime: RuntimePackage, force = false): Promise<void> {
     const manifest = await readManifest(runtime.config.source);
     const watchPaths = [
       ...getWatchPaths(runtime.config.source, manifest),
       ...(runtime.config.extraWatchPaths ?? []),
     ];
+    if (!force && runtime.watcher && runtime.watchPaths && areSameWatchPaths(runtime.watchPaths, watchPaths)) {
+      return;
+    }
+
+    await runtime.watcher?.close();
+    delete runtime.watcher;
+    runtime.watchPaths = watchPaths;
+
     const schedule = debounce(async () => {
       try {
         await this.publishRuntime(runtime);
@@ -264,6 +277,15 @@ class LiveNpmServerManager {
         this.logger.error(formatUnknownError(error));
       }
     }, runtime.debounceMs);
+    const scheduleRewatch = debounce(async () => {
+      try {
+        await this.publishRuntime(runtime);
+        await this.replaceWatcher(runtime, true);
+      } catch (error) {
+        this.logger.error(formatUnknownError(error));
+      }
+    }, runtime.debounceMs);
+    const ignored = createPublishWatchIgnored(runtime.config.source, manifest);
 
     const watcher = chokidar.watch(watchPaths, {
       awaitWriteFinish: {
@@ -271,15 +293,15 @@ class LiveNpmServerManager {
         stabilityThreshold: 150,
       },
       ignoreInitial: true,
-      ignored: [
-        '**/.git/**',
-        '**/.turbo/**',
-        '**/node_modules/**',
-      ],
+      ignored,
     });
 
     watcher.on('all', (event, changedPath) => {
       this.logger.debug(`${event} ${path.relative(runtime.config.source, changedPath)}`);
+      if (path.resolve(changedPath) === path.join(path.resolve(runtime.config.source), 'package.json')) {
+        scheduleRewatch();
+        return;
+      }
       schedule();
     });
     watcher.on('error', (error) => {
@@ -695,6 +717,13 @@ async function exists(file: string): Promise<boolean> {
 
 function runtimeKey(projectDir: string, packageName: string): string {
   return `${path.resolve(projectDir)}\0${packageName}`;
+}
+
+function areSameWatchPaths(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+  return left.every((watchPath, index) => watchPath === right[index]);
 }
 
 function debounce(callback: () => Promise<void>, delay: number): () => void {
