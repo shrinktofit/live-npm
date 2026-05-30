@@ -1,5 +1,6 @@
 import { copyFile, mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import chalk from 'chalk';
 import { createPublishPlan, type PublishPlan } from './package-plan.js';
 import { rewritePublishManifest } from './manifest-rewrite.js';
 import type { ManifestRewriteConfig } from './config.js';
@@ -26,10 +27,10 @@ export async function publishPackage(source: string, target: string, options: Pu
   assertSafeTarget(resolvedSource, resolvedTarget);
 
   const plan = await createPublishPlan(resolvedSource, resolvedTarget);
-  const packageLabel = `${plan.packageName} -> ${resolvedTarget}`;
+  const packageLabel = formatPackageTarget(plan.packageName, resolvedTarget);
 
   if (options.dryRun) {
-    options.logger.info(`[dry-run] ${packageLabel}: ${plan.files.length} files`);
+    options.logger.info(`${chalk.yellow('[dry-run]')} ${packageLabel}: ${formatCount(plan.files.length)} ${chalk.dim('files')}`);
     return {
       copied: plan.files.length,
       deleted: 0,
@@ -43,7 +44,7 @@ export async function publishPackage(source: string, target: string, options: Pu
   await mkdir(resolvedTarget, { recursive: true });
   const deleted = await deleteExtraneousFiles(plan, options.logger);
   const copied = await copyPublishFiles(plan, options.manifestRewrite);
-  options.logger.info(`${packageLabel}: copied ${copied} files, deleted ${deleted} stale files`);
+  options.logger.info(`${packageLabel}: ${chalk.green('copied')} ${formatCount(copied)} ${chalk.dim('files,')} ${formatDeleted(deleted)}`);
 
   return {
     copied,
@@ -143,6 +144,19 @@ async function removeEmptyDirs(root: string, dir: string): Promise<boolean> {
 
 function shouldSkipTargetEntry(name: string): boolean {
   return name === 'node_modules' || name === '.git' || name === '.pnpm';
+}
+
+function formatCount(count: number): string {
+  return chalk.cyan(String(count));
+}
+
+function formatDeleted(count: number): string {
+  const label = count === 0 ? chalk.dim('deleted') : chalk.yellow('deleted');
+  return `${label} ${formatCount(count)} ${chalk.dim('stale files')}`;
+}
+
+function formatPackageTarget(packageName: string, target: string): string {
+  return `${chalk.bold(packageName)} ${chalk.dim('->')} ${chalk.dim(target)}`;
 }
 
 function toRelativeFile(root: string, file: string): string {

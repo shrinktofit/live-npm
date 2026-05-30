@@ -5,6 +5,7 @@ const externals = [
   ...builtinModules,
   /^node:/,
   '@npmcli/arborist',
+  'chalk',
   'chokidar',
   'npm-packlist',
   'yaml',

@@ -9,12 +9,18 @@ import { randomUUID } from 'node:crypto';
 import { access, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import process from 'node:process';
 import path from 'node:path';
+import chalk from 'chalk';
 import chokidar, { type FSWatcher } from 'chokidar';
 import { loadConfig } from './config.js';
 import { consoleLogger, type Logger } from './logger.js';
 import { currentIntegrationVersion, integrationPnpmfileMode, integrationVersionFileName } from './integration-version.js';
 import { rewritePublishManifest } from './manifest-rewrite.js';
-import { createPublishWatchIgnored, readManifest, getWatchPaths } from './package-plan.js';
+import {
+  createPublishWatchIgnored,
+  getWatchPlan,
+  readManifest,
+  type ShallowWatchPath,
+} from './package-plan.js';
 import { publishPackage } from './publisher.js';
 import { resolveConfiguredPackages, type ResolvedLivePackage } from './workspace.js';
 
@@ -73,6 +79,7 @@ interface WatchGroup {
   projectDir: string;
   root: string;
   runtimes: Set<RuntimePackage>;
+  shallowWatchPaths?: ShallowWatchPath[];
   watcher?: FSWatcher;
   watchPaths?: string[];
 }
@@ -83,6 +90,13 @@ interface WatchEventStatus {
   packageNames: string[];
   path: string;
   relativePath: string;
+}
+
+interface PackageWatchRule {
+  ignored: (watchPath: string) => boolean;
+  recursiveWatchPaths: string[];
+  shallowWatchPaths: ShallowWatchPath[];
+  source: string;
 }
 
 interface PersistedServer {
@@ -154,7 +168,7 @@ export async function startLiveNpmServer(options: LiveNpmServerOptions): Promise
   for (const projectDir of projectDirs) {
     await manager.restoreProject(projectDir);
   }
-  logger.info(`live-npm server listening on ${url}`);
+  logger.info(`${chalk.bold.cyan('live-npm server')} ${chalk.green('listening')} ${chalk.dim('on')} ${chalk.cyan(url)}`);
 
   return {
     async close() {
@@ -240,7 +254,7 @@ class LiveNpmServerManager {
         const runtime = await this.ensureRuntime(resolvedProjectDir, persistedImport.packageName);
         runtime.targets.add(path.resolve(persistedImport.destinationDir));
         await this.publishRuntime(runtime);
-        this.logger.info(`restored ${persistedImport.packageName} -> ${persistedImport.destinationDir}`);
+        this.logger.info(`${chalk.green('restored')} ${formatPackageTarget(persistedImport.packageName, persistedImport.destinationDir)}`);
       } catch (error) {
         this.logger.warn(`could not restore ${persistedImport.packageName}: ${formatUnknownError(error)}`);
       }
@@ -265,6 +279,7 @@ class LiveNpmServerManager {
           packages: [...group.runtimes].map((runtime) => runtime.config.name).sort(),
           projectDir: group.projectDir,
           root: group.root,
+          shallowWatchPaths: group.shallowWatchPaths ?? [],
           watchedDirs: Object.keys(watched).length,
           watchedEntries: Object.values(watched).reduce((sum, entries) => sum + entries.length, 0),
           watchPaths: group.watchPaths ?? [],
@@ -336,13 +351,21 @@ class LiveNpmServerManager {
 
   private async replaceWatchGroup(group: WatchGroup, force = false): Promise<void> {
     const plan = await this.createWatchGroupPlan(group);
-    if (!force && group.watcher && group.watchPaths && areSameWatchPaths(group.watchPaths, plan.watchPaths)) {
+    if (
+      !force
+      && group.watcher
+      && group.watchPaths
+      && group.shallowWatchPaths
+      && areSameWatchPaths(group.watchPaths, plan.watchPaths)
+      && areSameShallowWatchPaths(group.shallowWatchPaths, plan.shallowWatchPaths)
+    ) {
       return;
     }
 
     await group.watcher?.close();
     delete group.watcher;
     group.watchPaths = plan.watchPaths;
+    group.shallowWatchPaths = plan.shallowWatchPaths;
     group.metadataPaths = plan.metadataPaths;
 
     const schedule = debounce(async () => {
@@ -384,7 +407,7 @@ class LiveNpmServerManager {
       this.logger.debug(`${event} ${path.relative(group.root, changedPath)}`);
       for (const runtime of affectedRuntimes) {
         group.pendingRuntimes.add(runtime);
-        if (isRuntimePackageJson(runtime, changedPath)) {
+        if (isRuntimePackageJson(runtime, changedPath) || isShallowTargetHit(plan.shallowWatchPaths, changedPath)) {
           group.pendingForceRewatch = true;
         }
       }
@@ -397,34 +420,37 @@ class LiveNpmServerManager {
 
     group.watcher = watcher;
     delete group.lastError;
-    this.logger.info(`watching ${group.kind} ${group.root} for ${group.runtimes.size} package(s)`);
+    this.logger.info(`${chalk.cyan('watching')} ${chalk.magenta(group.kind)} ${chalk.dim(group.root)} ${chalk.dim('for')} ${chalk.cyan(group.runtimes.size)} ${chalk.dim(plural(group.runtimes.size, 'package'))}`);
   }
 
   private async createWatchGroupPlan(group: WatchGroup): Promise<{
     ignored: (watchPath: string) => boolean;
     metadataPaths: string[];
+    shallowWatchPaths: ShallowWatchPath[];
     watchPaths: string[];
   }> {
     const watchPaths: string[] = [];
-    const packageRules: {
-      ignored: (watchPath: string) => boolean;
-      runtime: RuntimePackage;
-      source: string;
-    }[] = [];
+    const packageRules: PackageWatchRule[] = [];
     const metadataPaths: string[] = [];
+    const shallowWatchPaths: ShallowWatchPath[] = [];
 
     for (const runtime of group.runtimes) {
       const manifest = await readManifest(runtime.config.source);
+      const watchPlan = getWatchPlan(runtime.config.source, manifest);
       packageRules.push({
         ignored: createPublishWatchIgnored(runtime.config.source, manifest),
-        runtime,
+        recursiveWatchPaths: watchPlan.recursiveWatchPaths,
+        shallowWatchPaths: watchPlan.shallowWatchPaths,
         source: path.resolve(runtime.config.source),
       });
-      for (const watchPath of getWatchPaths(runtime.config.source, manifest)) {
-        addFoldedWatchPath(watchPaths, watchPath);
+      for (const watchPath of watchPlan.watchPaths) {
+        addUniqueWatchPath(watchPaths, watchPath);
+      }
+      for (const shallowWatchPath of watchPlan.shallowWatchPaths) {
+        addUniqueShallowWatchPath(shallowWatchPaths, shallowWatchPath);
       }
       for (const watchPath of runtime.config.extraWatchPaths ?? []) {
-        addFoldedWatchPath(watchPaths, watchPath);
+        addUniqueWatchPath(watchPaths, watchPath);
         metadataPaths.push(path.resolve(watchPath));
       }
     }
@@ -441,10 +467,11 @@ class LiveNpmServerManager {
           return true;
         }
 
-        return matchingPackageRules.every((rule) => rule.ignored(resolvedWatchPath));
+        return matchingPackageRules.every((rule) => shouldIgnorePackageWatchPath(rule, resolvedWatchPath));
       },
       metadataPaths: [...new Set(metadataPaths)].sort(),
-      watchPaths,
+      shallowWatchPaths: shallowWatchPaths.sort(compareShallowWatchPaths),
+      watchPaths: watchPaths.sort((left, right) => left.localeCompare(right)),
     };
   }
 
@@ -894,22 +921,73 @@ function areSameWatchPaths(left: string[], right: string[]): boolean {
   return left.every((watchPath, index) => watchPath === right[index]);
 }
 
-function addFoldedWatchPath(paths: string[], watchPath: string): void {
+function areSameShallowWatchPaths(left: ShallowWatchPath[], right: ShallowWatchPath[]): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+  return left.every((watchPath, index) => {
+    const rightWatchPath = right[index];
+    return rightWatchPath !== undefined
+      && watchPath.root === rightWatchPath.root
+      && watchPath.target === rightWatchPath.target;
+  });
+}
+
+function addUniqueWatchPath(paths: string[], watchPath: string): void {
   const resolvedWatchPath = path.resolve(watchPath);
-
-  for (const existing of paths) {
-    if (isInsideOrSame(existing, resolvedWatchPath)) {
-      return;
-    }
+  if (!paths.includes(resolvedWatchPath)) {
+    paths.push(resolvedWatchPath);
   }
+}
 
-  for (let index = paths.length - 1; index >= 0; index -= 1) {
-    if (isInsideOrSame(resolvedWatchPath, paths[index])) {
-      paths.splice(index, 1);
-    }
+function addUniqueShallowWatchPath(paths: ShallowWatchPath[], watchPath: ShallowWatchPath): void {
+  const resolvedWatchPath = {
+    root: path.resolve(watchPath.root),
+    target: path.resolve(watchPath.target),
+  };
+  if (paths.some((existing) => existing.root === resolvedWatchPath.root && existing.target === resolvedWatchPath.target)) {
+    return;
   }
-
   paths.push(resolvedWatchPath);
+}
+
+function compareShallowWatchPaths(left: ShallowWatchPath, right: ShallowWatchPath): number {
+  const rootOrder = left.root.localeCompare(right.root);
+  if (rootOrder !== 0) {
+    return rootOrder;
+  }
+  return left.target.localeCompare(right.target);
+}
+
+function shouldIgnorePackageWatchPath(rule: PackageWatchRule, resolvedWatchPath: string): boolean {
+  if (rule.recursiveWatchPaths.some((watchPath) => isInsideOrSame(watchPath, resolvedWatchPath))) {
+    return rule.ignored(resolvedWatchPath);
+  }
+  if (matchesShallowWatchPath(rule.shallowWatchPaths, resolvedWatchPath)) {
+    return rule.ignored(resolvedWatchPath);
+  }
+  return true;
+}
+
+function matchesShallowWatchPath(shallowWatchPaths: ShallowWatchPath[], changedPath: string): boolean {
+  const resolvedChangedPath = path.resolve(changedPath);
+  return shallowWatchPaths.some((watchPath) => {
+    const root = path.resolve(watchPath.root);
+    const target = path.resolve(watchPath.target);
+    return isInsideOrSame(root, resolvedChangedPath)
+      && (isInsideOrSame(target, resolvedChangedPath) || isInsideOrSame(resolvedChangedPath, target));
+  });
+}
+
+function isShallowTargetHit(shallowWatchPaths: ShallowWatchPath[], changedPath: string): boolean {
+  const resolvedChangedPath = path.resolve(changedPath);
+  return shallowWatchPaths.some((watchPath) => {
+    const root = path.resolve(watchPath.root);
+    const target = path.resolve(watchPath.target);
+    return resolvedChangedPath !== root
+      && isInsideOrSame(root, resolvedChangedPath)
+      && (isInsideOrSame(target, resolvedChangedPath) || isInsideOrSame(resolvedChangedPath, target));
+  });
 }
 
 function isInsideOrSame(parent: string, child: string): boolean {
@@ -919,6 +997,14 @@ function isInsideOrSame(parent: string, child: string): boolean {
 
 function isRuntimePackageJson(runtime: RuntimePackage, changedPath: string): boolean {
   return path.resolve(changedPath) === path.join(path.resolve(runtime.config.source), 'package.json');
+}
+
+function formatPackageTarget(packageName: string, target: string): string {
+  return `${chalk.bold(packageName)} ${chalk.dim('->')} ${chalk.dim(target)}`;
+}
+
+function plural(count: number, singular: string): string {
+  return count === 1 ? singular : `${singular}s`;
 }
 
 function debounce(callback: () => Promise<void>, delay: number): () => void {

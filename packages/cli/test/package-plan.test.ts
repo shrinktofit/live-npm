@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { createPublishWatchIgnored, getWatchPaths } from '../src/package-plan.js';
+import { createPublishWatchIgnored, getWatchPaths, getWatchPlan } from '../src/package-plan.js';
 
 describe('getWatchPaths', () => {
   it('normalizes globbed package.json#files entries to chokidar-compatible roots', async () => {
@@ -59,17 +59,23 @@ describe('getWatchPaths', () => {
     expect(paths.every((watchPath) => !watchPath.includes('!'))).toBe(true);
   });
 
-  it('falls back to the nearest existing parent for future build output directories', async () => {
+  it('uses a shallow parent watch for future build output directories', async () => {
     const source = await makePackageDir();
 
-    const paths = normalizePaths(getWatchPaths(source, {
+    const plan = getWatchPlan(source, {
       files: [
         'dist/**',
       ],
-    }));
+    });
+    const paths = normalizePaths(plan.watchPaths);
 
     expect(paths).toContain(normalizePath(source));
     expect(paths).not.toContain(normalizePath(path.join(source, 'dist')));
+    expect(normalizePaths(plan.recursiveWatchPaths)).not.toContain(normalizePath(source));
+    expect(normalizeShallowWatchPaths(plan.shallowWatchPaths)).toContainEqual({
+      root: normalizePath(source),
+      target: normalizePath(path.join(source, 'dist')),
+    });
   });
 
   it('keeps existing literal files as exact watch paths', async () => {
@@ -262,4 +268,11 @@ function normalizePaths(paths: string[]): string[] {
 
 function normalizePath(filePath: string): string {
   return path.resolve(filePath).replace(/\\/g, '/');
+}
+
+function normalizeShallowWatchPaths(paths: { root: string; target: string }[]): { root: string; target: string }[] {
+  return paths.map((watchPath) => ({
+    root: normalizePath(watchPath.root),
+    target: normalizePath(watchPath.target),
+  }));
 }

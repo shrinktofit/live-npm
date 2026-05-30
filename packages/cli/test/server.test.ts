@@ -87,6 +87,53 @@ describe('startLiveNpmServer', () => {
     });
   });
 
+  it('uses shallow package roots only to discover future publish directories', async () => {
+    const root = await makeTempDir();
+    const source = path.join(root, 'source');
+    const target = path.join(root, 'node_modules/.pnpm/live/node_modules/sample-package');
+    await writeSourcePackage(source, 'export const value = 1;\n', ['lib', 'public/**/*']);
+    await mkdir(path.join(source, 'src'), { recursive: true });
+    await writeFile(path.join(source, 'src/private.ts'), 'export const privateValue = 1;\n');
+    await mkdir(path.join(root, '.live-npm'), { recursive: true });
+    await writeFile(path.join(root, '.live-npm/config.yaml'), [
+      'debounceMs: 25',
+      'packages:',
+      '  - source: ../source',
+      '',
+    ].join('\n'));
+
+    server = await startLiveNpmServer({
+      host: '127.0.0.1',
+      logger: silentLogger,
+      port: 0,
+      projectDirs: [root],
+    });
+
+    await postJson(server.url, '/register-import', {
+      destinationDir: target,
+      packageName: 'sample-package',
+      projectDir: root,
+    }, root);
+
+    const status = await readStatus(root, server.url);
+    expect(status.watchGroups[0]?.shallowWatchPaths).toContainEqual({
+      root: source,
+      target: path.join(source, 'public'),
+    });
+
+    await writeFile(path.join(target, 'lib/index.js'), 'stale target\n');
+    await writeFile(path.join(source, 'src/private.ts'), 'export const privateValue = 2;\n');
+    await sleep(750);
+    await expect(readFile(path.join(target, 'lib/index.js'), 'utf8')).resolves.toContain('stale target');
+
+    await mkdir(path.join(source, 'public'), { recursive: true });
+    await writeFile(path.join(source, 'public/index.css'), 'body { color: red; }\n');
+    await waitFor(async () => {
+      await expect(readFile(path.join(target, 'public/index.css'), 'utf8')).resolves.toContain('color: red');
+      await expect(readFile(path.join(target, 'lib/index.js'), 'utf8')).resolves.toContain('value = 1');
+    });
+  });
+
   it('rebuilds package watchers when package.json publish files change', async () => {
     const root = await makeTempDir();
     const source = path.join(root, 'source');
@@ -715,6 +762,10 @@ interface StatusResponse {
     kind: string;
     packages: string[];
     root: string;
+    shallowWatchPaths?: {
+      root: string;
+      target: string;
+    }[];
   }[];
 }
 

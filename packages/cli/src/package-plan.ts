@@ -23,7 +23,31 @@ export interface PublishPlan {
   target: string;
 }
 
+export interface PublishWatchPlan {
+  recursiveWatchPaths: string[];
+  shallowWatchPaths: ShallowWatchPath[];
+  watchPaths: string[];
+}
+
+export interface ShallowWatchPath {
+  root: string;
+  target: string;
+}
+
 export type WatchIgnoredPredicate = (watchPath: string) => boolean;
+
+interface RecursiveWatchPathCandidate {
+  kind: 'recursive';
+  path: string;
+}
+
+interface ShallowWatchPathCandidate {
+  kind: 'shallow';
+  root: string;
+  target: string;
+}
+
+type WatchPathCandidate = RecursiveWatchPathCandidate | ShallowWatchPathCandidate;
 
 export async function createPublishPlan(source: string, target: string): Promise<PublishPlan> {
   const manifest = await readManifest(source);
@@ -47,32 +71,40 @@ export async function readManifest(source: string): Promise<PackageManifest> {
   return JSON.parse(raw) as PackageManifest;
 }
 
-export function getWatchPaths(source: string, manifest: PackageManifest): string[] {
+export function getWatchPlan(source: string, manifest: PackageManifest): PublishWatchPlan {
   const files = readFilesField(manifest);
-  const watchPaths: string[] = [];
+  const recursiveWatchPaths: string[] = [];
+  const shallowWatchPaths: ShallowWatchPath[] = [];
   const resolvedSource = path.resolve(source);
-  const addWatchPath = (watchPath: string) => {
-    addFoldedWatchPath(watchPaths, watchPath);
+  const addWatchPath = (candidate: WatchPathCandidate | undefined) => {
+    if (!candidate) {
+      return;
+    }
+    if (candidate.kind === 'recursive') {
+      addFoldedWatchPath(recursiveWatchPaths, candidate.path);
+      removeCoveredShallowWatchPaths(shallowWatchPaths, recursiveWatchPaths);
+      return;
+    }
+    addShallowWatchPath(shallowWatchPaths, candidate, recursiveWatchPaths);
   };
 
-  addWatchPath(path.join(resolvedSource, 'package.json'));
+  addWatchPath({
+    kind: 'recursive',
+    path: path.join(resolvedSource, 'package.json'),
+  });
   for (const entry of readAlwaysIncludedManifestEntries(manifest)) {
-    const watchPath = watchPathFromManifestEntry(resolvedSource, entry);
-    if (watchPath) {
-      addWatchPath(watchPath);
-    }
+    addWatchPath(watchPathFromManifestEntry(resolvedSource, entry));
   }
 
   if (files) {
     for (const entry of files) {
-      const watchPath = watchPathFromFilesEntry(resolvedSource, entry);
-      if (!watchPath) {
-        continue;
-      }
-      addWatchPath(watchPath);
+      addWatchPath(watchPathFromFilesEntry(resolvedSource, entry));
     }
   } else {
-    addWatchPath(resolvedSource);
+    addWatchPath({
+      kind: 'recursive',
+      path: resolvedSource,
+    });
   }
 
   for (const defaultFile of [
@@ -86,10 +118,28 @@ export function getWatchPaths(source: string, manifest: PackageManifest): string
     'LICENCE.md',
     'NOTICE',
   ]) {
-    addWatchPath(path.join(resolvedSource, defaultFile));
+    addWatchPath({
+      kind: 'recursive',
+      path: path.join(resolvedSource, defaultFile),
+    });
   }
 
-  return watchPaths;
+  const normalizedRecursiveWatchPaths = [...recursiveWatchPaths].sort((left, right) => left.localeCompare(right));
+  const normalizedShallowWatchPaths = normalizeShallowWatchPaths(shallowWatchPaths, normalizedRecursiveWatchPaths);
+  const watchPaths = [
+    ...normalizedRecursiveWatchPaths,
+    ...normalizedShallowWatchPaths.map((watchPath) => watchPath.root),
+  ];
+
+  return {
+    recursiveWatchPaths: normalizedRecursiveWatchPaths,
+    shallowWatchPaths: normalizedShallowWatchPaths,
+    watchPaths: [...new Set(watchPaths)].sort((left, right) => left.localeCompare(right)),
+  };
+}
+
+export function getWatchPaths(source: string, manifest: PackageManifest): string[] {
+  return getWatchPlan(source, manifest).watchPaths;
 }
 
 function readPackageName(manifest: PackageManifest, source: string): string {
@@ -108,6 +158,67 @@ function readFilesField(manifest: PackageManifest): string[] | undefined {
 
 function normalizePacklist(files: string[]): string[] {
   return [...new Set(files.map((file) => file.replace(/\\/g, '/')))].sort();
+}
+
+function normalizeShallowWatchPaths(
+  shallowWatchPaths: ShallowWatchPath[],
+  recursiveWatchPaths: string[],
+): ShallowWatchPath[] {
+  removeCoveredShallowWatchPaths(shallowWatchPaths, recursiveWatchPaths);
+  return [...shallowWatchPaths].sort((left, right) => {
+    const rootOrder = left.root.localeCompare(right.root);
+    if (rootOrder !== 0) {
+      return rootOrder;
+    }
+    return left.target.localeCompare(right.target);
+  });
+}
+
+function addShallowWatchPath(
+  shallowWatchPaths: ShallowWatchPath[],
+  candidate: Extract<WatchPathCandidate, { kind: 'shallow' }>,
+  recursiveWatchPaths: string[],
+): void {
+  const root = path.resolve(candidate.root);
+  const target = path.resolve(candidate.target);
+  if (recursiveWatchPaths.some((watchPath) => isInsideOrSame(watchPath, root))) {
+    return;
+  }
+  if (shallowWatchPaths.some((watchPath) => watchPath.root === root && watchPath.target === target)) {
+    return;
+  }
+  shallowWatchPaths.push({ root, target });
+}
+
+function removeCoveredShallowWatchPaths(
+  shallowWatchPaths: ShallowWatchPath[],
+  recursiveWatchPaths: string[],
+): void {
+  for (let index = shallowWatchPaths.length - 1; index >= 0; index -= 1) {
+    const shallowWatchPath = shallowWatchPaths[index];
+    if (!shallowWatchPath) {
+      continue;
+    }
+    if (recursiveWatchPaths.some((watchPath) => isInsideOrSame(watchPath, shallowWatchPath.root))) {
+      shallowWatchPaths.splice(index, 1);
+    }
+  }
+}
+
+function watchCandidateFromTarget(source: string, target: string): WatchPathCandidate {
+  const resolvedTarget = path.resolve(target);
+  const nearestExisting = nearestExistingPath(source, resolvedTarget);
+  if (nearestExisting === resolvedTarget) {
+    return {
+      kind: 'recursive',
+      path: nearestExisting,
+    };
+  }
+  return {
+    kind: 'shallow',
+    root: nearestExisting,
+    target: resolvedTarget,
+  };
 }
 
 export function createPublishWatchIgnored(source: string, manifest: PackageManifest): WatchIgnoredPredicate {
@@ -139,7 +250,7 @@ export function createPublishWatchIgnored(source: string, manifest: PackageManif
   };
 }
 
-function watchPathFromFilesEntry(source: string, entry: string): string | undefined {
+function watchPathFromFilesEntry(source: string, entry: string): WatchPathCandidate | undefined {
   const normalizedEntry = normalizeFilesEntry(entry);
   if (!normalizedEntry || normalizedEntry.startsWith('!')) {
     return undefined;
@@ -154,7 +265,10 @@ function watchPathFromFilesEntry(source: string, entry: string): string | undefi
       continue;
     }
     if (part === '..') {
-      return source;
+      return {
+        kind: 'recursive',
+        path: source,
+      };
     }
     if (hasGlobToken(part)) {
       break;
@@ -166,13 +280,16 @@ function watchPathFromFilesEntry(source: string, entry: string): string | undefi
     ? source
     : path.join(source, ...stableParts);
   if (!isInsideOrSame(source, candidate)) {
-    return source;
+    return {
+      kind: 'recursive',
+      path: source,
+    };
   }
 
-  return nearestExistingPath(source, candidate);
+  return watchCandidateFromTarget(source, candidate);
 }
 
-function watchPathFromManifestEntry(source: string, entry: string): string | undefined {
+function watchPathFromManifestEntry(source: string, entry: string): WatchPathCandidate | undefined {
   const normalizedEntry = normalizeFilesEntry(entry);
   if (!normalizedEntry || isNeverIncludedRelativePath(normalizedEntry)) {
     return undefined;
@@ -182,7 +299,7 @@ function watchPathFromManifestEntry(source: string, entry: string): string | und
   if (!isInsideOrSame(source, candidate)) {
     return undefined;
   }
-  return nearestExistingPath(source, candidate);
+  return watchCandidateFromTarget(source, candidate);
 }
 
 function readAlwaysIncludedManifestEntries(manifest: PackageManifest): string[] {

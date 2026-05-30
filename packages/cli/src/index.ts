@@ -4,6 +4,7 @@ import { request as createRequest } from 'node:http';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import process from 'node:process';
+import chalk from 'chalk';
 import yargs from 'yargs/yargs';
 import { consoleLogger } from './logger.js';
 import { integrateProject } from './integrate.js';
@@ -44,6 +45,10 @@ interface LiveNpmStatusWatchGroup {
   lastError?: string;
   packages: string[];
   root: string;
+  shallowWatchPaths?: {
+    root: string;
+    target: string;
+  }[];
   watchedDirs: number;
   watchedEntries: number;
   watchPaths: string[];
@@ -85,21 +90,21 @@ export async function runCli(args: string[]): Promise<void> {
       const result = await integrateProject({
         projectDir: process.cwd(),
       });
-      consoleLogger.info(`wrote ${path.join(result.liveDir, 'pnpm-hooks.cjs')}`);
-      consoleLogger.info(`wrote ${path.join(result.liveDir, 'pnpmfile.cjs')}`);
+      consoleLogger.info(formatFileAction('wrote', path.join(result.liveDir, 'pnpm-hooks.cjs')));
+      consoleLogger.info(formatFileAction('wrote', path.join(result.liveDir, 'pnpmfile.cjs')));
       if (result.configCreated) {
-        consoleLogger.info(`wrote ${result.configPath}`);
+        consoleLogger.info(formatFileAction('wrote', result.configPath));
       } else {
-        consoleLogger.info(`kept existing ${result.configPath}`);
+        consoleLogger.info(formatFileAction('kept', result.configPath));
       }
       if (result.createdRootPnpmfile && result.rootPnpmfilePath) {
-        consoleLogger.info(`wrote ${result.rootPnpmfilePath}`);
+        consoleLogger.info(formatFileAction('wrote', result.rootPnpmfilePath));
       } else if (result.rootPnpmfileAction === 'updated' && result.rootPnpmfilePath) {
-        consoleLogger.info(`updated ${result.rootPnpmfilePath}`);
+        consoleLogger.info(formatFileAction('updated', result.rootPnpmfilePath));
       } else if (result.rootPnpmfilePath) {
-        consoleLogger.info(`kept existing ${result.rootPnpmfilePath}`);
+        consoleLogger.info(formatFileAction('kept', result.rootPnpmfilePath));
       }
-      consoleLogger.info('add .live-npm/ to your project .gitignore for local-only integration files.');
+      consoleLogger.info(chalk.yellow('add .live-npm/ to your project .gitignore for local-only integration files.'));
     })
     .command('status', 'Print live-npm server status for a project', (command) => command
       .option('project', {
@@ -181,41 +186,129 @@ async function requestStatus(serverState: ServerState): Promise<LiveNpmStatus> {
 }
 
 function formatStatus(status: LiveNpmStatus): string {
+  const watchGroups = status.watchGroups ?? [];
+  const packages = status.packages ?? [];
+  const totalWatchRoots = sumBy(watchGroups, (group) => group.watchPaths.length);
+  const totalShallowRoots = sumBy(watchGroups, (group) => group.shallowWatchPaths?.length ?? 0);
+  const totalWatchedDirs = sumBy(watchGroups, (group) => group.watchedDirs);
+  const totalWatchedEntries = sumBy(watchGroups, (group) => group.watchedEntries);
+  const errorCount = [
+    ...watchGroups.map((group) => group.lastError),
+    ...packages.map((statusPackage) => statusPackage.lastError),
+  ].filter(Boolean).length;
   const lines = [
-    'live-npm server',
-    `  pid: ${status.pid ?? 'unknown'}`,
+    `${chalk.bold.cyan('live-npm server')}  ${formatLabel('pid:')} ${formatValue(status.pid ?? 'unknown')}  ${formatHealth(errorCount)}`,
   ];
 
   for (const project of status.projects ?? []) {
-    lines.push(`  project: ${project}`);
+    lines.push(`  ${formatLabel('project:')} ${formatPath(project)}`);
   }
 
-  lines.push('', 'watch groups');
-  for (const group of status.watchGroups ?? []) {
-    lines.push(`  ${group.kind}: ${group.root}`);
-    lines.push(`    packages: ${group.packages.join(', ') || '-'}`);
-    lines.push(`    watch roots: ${group.watchPaths.length}`);
-    lines.push(`    watched dirs: ${group.watchedDirs}`);
-    lines.push(`    watched entries: ${group.watchedEntries}`);
+  lines.push(
+    '',
+    `${formatSection('watch groups')}  ${formatMuted(`${watchGroups.length} ${plural(watchGroups.length, 'group')}, ${totalWatchRoots} ${plural(totalWatchRoots, 'root')}, ${totalWatchedDirs} ${plural(totalWatchedDirs, 'dir')}, ${totalWatchedEntries} ${plural(totalWatchedEntries, 'entry')}`)}`,
+  );
+  for (const group of watchGroups) {
+    lines.push(`  ${formatKind(group.kind)} ${formatPath(group.root)} ${formatHealth(group.lastError ? 1 : 0)}`);
+    lines.push(`    ${formatLabel('packages:')} ${formatPackageList(group.packages)}`);
+    lines.push(`    ${formatLabel('watch roots:')} ${formatValue(group.watchPaths.length)}`);
+    if (group.shallowWatchPaths?.length) {
+      lines.push(`    ${formatLabel('shallow roots:')} ${formatValue(group.shallowWatchPaths.length)}`);
+    }
+    lines.push(`    ${formatLabel('watched dirs:')} ${formatValue(group.watchedDirs)}`);
+    lines.push(`    ${formatLabel('watched entries:')} ${formatValue(group.watchedEntries)}`);
     if (group.lastError) {
-      lines.push(`    last error: ${group.lastError}`);
+      lines.push(`    ${formatErrorLabel('last error:')} ${chalk.red(group.lastError)}`);
     }
   }
 
-  lines.push('', 'packages');
-  for (const statusPackage of status.packages ?? []) {
-    lines.push(`  ${statusPackage.name}`);
-    lines.push(`    source: ${statusPackage.source}`);
-    lines.push(`    targets: ${statusPackage.targets.length}`);
+  lines.push(
+    '',
+    `${formatSection('packages')}  ${formatMuted(`${packages.length} ${plural(packages.length, 'package')}, ${totalTargets(packages)} ${plural(totalTargets(packages), 'target')}, ${totalShallowRoots} shallow ${plural(totalShallowRoots, 'root')}`)}`,
+  );
+  for (const statusPackage of packages) {
+    lines.push(`  ${formatPackageName(statusPackage.name)} ${formatHealth(statusPackage.lastError ? 1 : 0)}`);
+    lines.push(`    ${formatLabel('source:')} ${formatPath(statusPackage.source)}`);
+    lines.push(`    ${formatLabel('targets:')} ${formatValue(statusPackage.targets.length)}`);
     if (statusPackage.lastPublishAt) {
-      lines.push(`    last publish: ${statusPackage.lastPublishAt}`);
+      lines.push(`    ${formatLabel('last publish:')} ${formatMuted(statusPackage.lastPublishAt)}`);
     }
     if (statusPackage.lastError) {
-      lines.push(`    last error: ${statusPackage.lastError}`);
+      lines.push(`    ${formatErrorLabel('last error:')} ${chalk.red(statusPackage.lastError)}`);
     }
   }
 
   return lines.join('\n');
+}
+
+function formatFileAction(action: 'kept' | 'updated' | 'wrote', filePath: string): string {
+  const actionColor = action === 'wrote'
+    ? chalk.green
+    : action === 'updated'
+      ? chalk.cyan
+      : chalk.dim;
+  return `${actionColor(action.padEnd(7))} ${formatPath(filePath)}`;
+}
+
+function formatHealth(errorCount: number): string {
+  return errorCount > 0 ? chalk.red('error') : chalk.green('ok');
+}
+
+function formatKind(kind: string): string {
+  return chalk.magenta(kind);
+}
+
+function formatLabel(label: string): string {
+  return chalk.dim(label);
+}
+
+function formatErrorLabel(label: string): string {
+  return chalk.red(label);
+}
+
+function formatMuted(value: string): string {
+  return chalk.dim(value);
+}
+
+function formatPackageList(packages: string[]): string {
+  if (packages.length === 0) {
+    return formatMuted('-');
+  }
+  return packages.map(formatPackageName).join(formatMuted(', '));
+}
+
+function formatPackageName(packageName: string): string {
+  return chalk.bold(packageName);
+}
+
+function formatPath(filePath: string): string {
+  return chalk.dim(filePath);
+}
+
+function formatSection(label: string): string {
+  return chalk.bold(label);
+}
+
+function formatValue(value: number | string): string {
+  return chalk.cyan(String(value));
+}
+
+function plural(count: number, singular: string): string {
+  if (count === 1) {
+    return singular;
+  }
+  if (singular === 'entry') {
+    return 'entries';
+  }
+  return `${singular}s`;
+}
+
+function sumBy<T>(items: T[], read: (item: T) => number): number {
+  return items.reduce((sum, item) => sum + read(item), 0);
+}
+
+function totalTargets(packages: LiveNpmStatusPackage[]): number {
+  return sumBy(packages, (statusPackage) => statusPackage.targets.length);
 }
 
 async function waitForClose(close: () => Promise<void>): Promise<void> {

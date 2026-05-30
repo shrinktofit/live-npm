@@ -1,3 +1,5 @@
+import { chalkStderr } from 'chalk';
+
 export interface Logger {
   debug(message: string): void;
   info(message: string): void;
@@ -11,16 +13,16 @@ const noop = (): undefined => {
 
 export const consoleLogger: Logger = {
   debug(message) {
-    console.debug(message);
+    console.debug(chalkStderr.dim(message));
   },
   info(message) {
     console.info(message);
   },
   warn(message) {
-    console.warn(message);
+    console.warn(chalkStderr.yellow(message));
   },
   error(message) {
-    console.error(message);
+    console.error(chalkStderr.red(message));
   },
 };
 
