@@ -1,8 +1,8 @@
-import { mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { publishPackage } from '../src/publisher.js';
+import { publishPackage, publishPackageChange } from '../src/publisher.js';
 import { silentLogger } from '../src/logger.js';
 
 describe('publishPackage', () => {
@@ -56,6 +56,77 @@ describe('publishPackage', () => {
     expect(result.files).toContain('package.json');
     expect(result.files).toContain('src/index.ts');
     await expect(readFile(path.join(target, 'src/index.ts'), 'utf8')).resolves.toContain('value = 1');
+  });
+
+  it('updates only the changed published file during incremental publishes', async () => {
+    const root = await makeTempDir();
+    const source = path.join(root, 'source');
+    const target = path.join(root, 'target');
+    await mkdir(path.join(source, 'lib'), { recursive: true });
+    await writeFile(path.join(source, 'package.json'), JSON.stringify({
+      name: 'sample-package',
+      version: '0.0.0',
+      files: [
+        'lib',
+      ],
+    }, null, 2));
+    await writeFile(path.join(source, 'lib/index.js'), 'export const value = 1;\n');
+    await writeFile(path.join(source, 'lib/other.js'), 'export const other = 1;\n');
+
+    await publishPackage(source, target, {
+      dryRun: false,
+      logger: silentLogger,
+    });
+    await writeFile(path.join(target, 'lib/other.js'), 'stale unrelated target\n');
+    await writeFile(path.join(source, 'lib/index.js'), 'export const value = 2;\n');
+
+    const result = await publishPackageChange(source, target, {
+      event: 'change',
+      path: path.join(source, 'lib/index.js'),
+    }, {
+      dryRun: false,
+      logger: silentLogger,
+    });
+
+    expect(result.copied).toBe(1);
+    expect(result.deleted).toBe(0);
+    await expect(readFile(path.join(target, 'lib/index.js'), 'utf8')).resolves.toContain('value = 2');
+    await expect(readFile(path.join(target, 'lib/other.js'), 'utf8')).resolves.toContain('stale unrelated target');
+  });
+
+  it('deletes only the changed target file during incremental unlinks', async () => {
+    const root = await makeTempDir();
+    const source = path.join(root, 'source');
+    const target = path.join(root, 'target');
+    await mkdir(path.join(source, 'lib'), { recursive: true });
+    await writeFile(path.join(source, 'package.json'), JSON.stringify({
+      name: 'sample-package',
+      version: '0.0.0',
+      files: [
+        'lib',
+      ],
+    }, null, 2));
+    await writeFile(path.join(source, 'lib/index.js'), 'export const value = 1;\n');
+    await writeFile(path.join(source, 'lib/other.js'), 'export const other = 1;\n');
+
+    await publishPackage(source, target, {
+      dryRun: false,
+      logger: silentLogger,
+    });
+    await rm(path.join(source, 'lib/index.js'));
+
+    const result = await publishPackageChange(source, target, {
+      event: 'unlink',
+      path: path.join(source, 'lib/index.js'),
+    }, {
+      dryRun: false,
+      logger: silentLogger,
+    });
+
+    expect(result.copied).toBe(0);
+    expect(result.deleted).toBe(1);
+    await expectExists(path.join(target, 'lib/index.js'), false);
+    await expect(readFile(path.join(target, 'lib/other.js'), 'utf8')).resolves.toContain('other = 1');
   });
 });
 

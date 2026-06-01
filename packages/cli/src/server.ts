@@ -21,7 +21,7 @@ import {
   readManifest,
   type ShallowWatchPath,
 } from './package-plan.js';
-import { publishPackage } from './publisher.js';
+import { publishPackage, publishPackageChanges, type PublishFileChange } from './publisher.js';
 import { resolveConfiguredPackages, type ResolvedLivePackage } from './workspace.js';
 
 const liveDirName = '.live-npm';
@@ -67,6 +67,14 @@ interface RuntimePackage {
   targets: Set<string>;
 }
 
+interface ProjectRuntime {
+  configError?: string;
+  configPath: string;
+  projectDir: string;
+  warnedMissingState: boolean;
+  watcher?: FSWatcher;
+}
+
 interface WatchGroup {
   debounceMs: number;
   kind: ResolvedLivePackage['watchGroup']['kind'];
@@ -75,7 +83,7 @@ interface WatchGroup {
   lastEvent?: WatchEventStatus;
   metadataPaths: string[];
   pendingForceRewatch: boolean;
-  pendingRuntimes: Set<RuntimePackage>;
+  pendingPublishes: Map<RuntimePackage, PendingPublish>;
   projectDir: string;
   root: string;
   runtimes: Set<RuntimePackage>;
@@ -91,6 +99,22 @@ interface WatchEventStatus {
   path: string;
   relativePath: string;
 }
+
+interface PendingPublish {
+  changes: PublishFileChange[];
+  full: boolean;
+}
+
+type PendingPublishKind
+  = | {
+    forceRewatch: boolean;
+    full: true;
+  }
+  | {
+    change: PublishFileChange;
+    forceRewatch: boolean;
+    full: false;
+  };
 
 interface PackageWatchRule {
   ignored: (watchPath: string) => boolean;
@@ -166,7 +190,7 @@ export async function startLiveNpmServer(options: LiveNpmServerOptions): Promise
     await warnIfOutdatedIntegration(projectDir, logger);
   }
   for (const projectDir of projectDirs) {
-    await manager.restoreProject(projectDir);
+    await manager.startProject(projectDir);
   }
   logger.info(`${chalk.bold.cyan('live-npm server')} ${chalk.green('listening')} ${chalk.dim('on')} ${chalk.cyan(url)}`);
 
@@ -192,6 +216,7 @@ export async function startLiveNpmServer(options: LiveNpmServerOptions): Promise
 
 class LiveNpmServerManager {
   private readonly logger: Logger;
+  private readonly projects = new Map<string, ProjectRuntime>();
   private readonly runtimes = new Map<string, RuntimePackage>();
   private readonly token: string;
   private readonly watchGroups = new Map<string, WatchGroup>();
@@ -239,36 +264,30 @@ class LiveNpmServerManager {
     };
   }
 
-  async restoreProject(projectDir: string): Promise<void> {
+  async startProject(projectDir: string): Promise<void> {
     const resolvedProjectDir = path.resolve(projectDir);
-    if (!await exists(path.join(resolvedProjectDir, liveDirName, stateFileName))) {
-      if (await exists(path.join(resolvedProjectDir, liveDirName, 'config.yaml'))) {
-        this.logger.warn(`No ${path.join(resolvedProjectDir, liveDirName, stateFileName)} found. Run pnpm install once while live-npm is running so pnpm can register live package import targets.`);
-      }
-      return;
-    }
-
-    const state = await readState(resolvedProjectDir);
-    for (const persistedImport of state.imports) {
-      try {
-        const runtime = await this.ensureRuntime(resolvedProjectDir, persistedImport.packageName);
-        runtime.targets.add(path.resolve(persistedImport.destinationDir));
-        await this.publishRuntime(runtime);
-        this.logger.info(`${chalk.green('restored')} ${formatPackageTarget(persistedImport.packageName, persistedImport.destinationDir)}`);
-      } catch (error) {
-        this.logger.warn(`could not restore ${persistedImport.packageName}: ${formatUnknownError(error)}`);
-      }
-    }
+    const project = this.ensureProject(resolvedProjectDir);
+    await this.reconcileProject(project, { keepCurrentOnError: false, warnMissingState: true });
+    await this.watchProjectConfig(project);
   }
 
   async close(): Promise<void> {
-    await Promise.all([...this.watchGroups.values()].map(async (group) => group.watcher?.close()));
+    await Promise.all([
+      ...[...this.watchGroups.values()].map(async (group) => group.watcher?.close()),
+      ...[...this.projects.values()].map(async (project) => project.watcher?.close()),
+    ]);
   }
 
   status(): unknown {
     return {
       pid: process.pid,
-      projects: [...new Set([...this.runtimes.values()].map((runtime) => runtime.projectDir))].sort(),
+      projectErrors: [...this.projects.values()]
+        .filter((project) => project.configError)
+        .map((project) => ({
+          error: project.configError,
+          projectDir: project.projectDir,
+        })),
+      projects: [...this.projects.keys()].sort(),
       watchGroups: [...this.watchGroups.values()].map((group) => {
         const watched = group.watcher?.getWatched() ?? {};
         return {
@@ -297,8 +316,191 @@ class LiveNpmServerManager {
     };
   }
 
+  private ensureProject(projectDir: string): ProjectRuntime {
+    const resolvedProjectDir = path.resolve(projectDir);
+    const existing = this.projects.get(resolvedProjectDir);
+    if (existing) {
+      return existing;
+    }
+
+    const project: ProjectRuntime = {
+      configPath: path.join(resolvedProjectDir, liveDirName, 'config.yaml'),
+      projectDir: resolvedProjectDir,
+      warnedMissingState: false,
+    };
+    this.projects.set(resolvedProjectDir, project);
+    return project;
+  }
+
+  private async watchProjectConfig(project: ProjectRuntime): Promise<void> {
+    if (project.watcher) {
+      return;
+    }
+
+    const schedule = debounce(async () => {
+      await this.reconcileProject(project, { keepCurrentOnError: true, warnMissingState: false });
+    }, 100);
+    const watcher = chokidar.watch(project.configPath, {
+      awaitWriteFinish: {
+        pollInterval: 50,
+        stabilityThreshold: 150,
+      },
+      ignoreInitial: true,
+    });
+    watcher.on('all', (event) => {
+      this.logger.debug(`project config ${event} ${project.configPath}`);
+      schedule();
+    });
+    watcher.on('error', (error) => {
+      project.configError = formatErrorMessage(error);
+      this.logger.error(formatUnknownError(error));
+    });
+    project.watcher = watcher;
+  }
+
+  private async reconcileProject(
+    projectRuntime: ProjectRuntime,
+    options: {
+      keepCurrentOnError: boolean;
+      warnMissingState: boolean;
+    },
+  ): Promise<void> {
+    try {
+      await this.applyProjectConfig(projectRuntime, options);
+      delete projectRuntime.configError;
+    } catch (error) {
+      projectRuntime.configError = formatErrorMessage(error);
+      if (!options.keepCurrentOnError) {
+        throw error;
+      }
+      this.logger.error(`could not reload ${projectRuntime.configPath}: ${formatUnknownError(error)}`);
+    }
+  }
+
+  private async applyProjectConfig(
+    projectRuntime: ProjectRuntime,
+    options: {
+      warnMissingState: boolean;
+    },
+  ): Promise<void> {
+    const stateExists = await exists(path.join(projectRuntime.projectDir, liveDirName, stateFileName));
+    if (!await exists(projectRuntime.configPath)) {
+      if (this.hasProjectRuntimes(projectRuntime.projectDir)) {
+        throw new Error(`Config ${projectRuntime.configPath} does not exist.`);
+      }
+      if (stateExists && options.warnMissingState) {
+        this.logger.warn(`No ${projectRuntime.configPath} found. live-npm cannot restore persisted live package targets until config.yaml is created.`);
+      }
+      return;
+    }
+
+    const project = await loadProject(projectRuntime.projectDir);
+    if (!stateExists && options.warnMissingState && !projectRuntime.warnedMissingState) {
+      projectRuntime.warnedMissingState = true;
+      this.logger.warn(`No ${path.join(projectRuntime.projectDir, liveDirName, stateFileName)} found. Run pnpm install once while live-npm is running so pnpm can register live package import targets.`);
+    }
+
+    const state = stateExists
+      ? await readState(projectRuntime.projectDir)
+      : { imports: [], version: 1 } satisfies PersistedState;
+    const importTargets = groupImportsByPackage(state.imports);
+    const desiredConfigByName = new Map(project.packages.map((packageConfig) => [packageConfig.name, packageConfig]));
+    const existingRuntimes = [...this.runtimes.values()]
+      .filter((runtime) => runtime.projectDir === projectRuntime.projectDir);
+    const existingRuntimeByName = new Map(existingRuntimes.map((runtime) => [runtime.config.name, runtime]));
+
+    for (const runtime of existingRuntimes) {
+      if (!desiredConfigByName.has(runtime.config.name)) {
+        await this.removeRuntime(runtime, { deleteTargets: true });
+      }
+    }
+    for (const [packageName, targets] of importTargets) {
+      if (!desiredConfigByName.has(packageName) && !existingRuntimeByName.has(packageName)) {
+        await this.deletePackageTargets(projectRuntime.projectDir, packageName, [
+          packageStagingDir(projectRuntime.projectDir, packageName),
+          ...targets,
+        ]);
+      }
+    }
+
+    const activeNames = new Set([
+      ...existingRuntimeByName.keys(),
+      ...importTargets.keys(),
+    ]);
+    for (const packageName of [...activeNames].sort((left, right) => left.localeCompare(right))) {
+      const config = desiredConfigByName.get(packageName);
+      if (!config) {
+        continue;
+      }
+
+      const existing = this.runtimes.get(runtimeKey(projectRuntime.projectDir, packageName));
+      const targets = new Set([
+        packageStagingDir(projectRuntime.projectDir, packageName),
+        ...(importTargets.get(packageName) ?? []),
+        ...(existing ? [...existing.targets] : []),
+      ]);
+
+      if (existing) {
+        await this.updateRuntimeConfig(existing, config, project.debounceMs, targets);
+        continue;
+      }
+
+      const runtime: RuntimePackage = {
+        config,
+        debounceMs: project.debounceMs,
+        projectDir: projectRuntime.projectDir,
+        targets,
+      };
+      this.runtimes.set(runtimeKey(projectRuntime.projectDir, config.name), runtime);
+      await this.startRuntime(runtime);
+      for (const target of importTargets.get(packageName) ?? []) {
+        this.logger.info(`${chalk.green('restored')} ${formatPackageTarget(packageName, target)}`);
+      }
+    }
+
+    if (stateExists || [...this.runtimes.values()].some((runtime) => runtime.projectDir === projectRuntime.projectDir)) {
+      await this.writeState(projectRuntime.projectDir);
+    }
+  }
+
+  private hasProjectRuntimes(projectDir: string): boolean {
+    return [...this.runtimes.values()].some((runtime) => runtime.projectDir === projectDir);
+  }
+
+  private async updateRuntimeConfig(
+    runtime: RuntimePackage,
+    config: ResolvedLivePackage,
+    debounceMs: number,
+    targets: Set<string>,
+  ): Promise<void> {
+    const oldWatchGroupKey = runtime.config.watchGroup.key;
+    const configChanged = serializeResolvedLivePackage(runtime.config) !== serializeResolvedLivePackage(config);
+    const debounceChanged = runtime.debounceMs !== debounceMs;
+    runtime.config = config;
+    runtime.debounceMs = debounceMs;
+    runtime.targets = targets;
+
+    if (!configChanged && !debounceChanged) {
+      return;
+    }
+
+    if (oldWatchGroupKey !== config.watchGroup.key) {
+      await this.unregisterRuntimeWatcher(runtime, oldWatchGroupKey);
+      await this.registerRuntimeWatcher(runtime);
+    } else {
+      const group = this.watchGroups.get(watchGroupRuntimeKey(runtime.projectDir, config.watchGroup.key));
+      if (group) {
+        group.debounceMs = debounceMs;
+        await this.replaceWatchGroup(group, true);
+      }
+    }
+
+    await this.publishRuntime(runtime);
+  }
+
   private async ensureRuntime(projectDir: string, packageName: string): Promise<RuntimePackage> {
     const resolvedProjectDir = path.resolve(projectDir);
+    this.ensureProject(resolvedProjectDir);
     const key = runtimeKey(resolvedProjectDir, packageName);
     const existing = this.runtimes.get(key);
     if (existing) {
@@ -337,7 +539,7 @@ class LiveNpmServerManager {
         kind: runtime.config.watchGroup.kind,
         metadataPaths: [],
         pendingForceRewatch: false,
-        pendingRuntimes: new Set(),
+        pendingPublishes: new Map(),
         projectDir: runtime.projectDir,
         root: runtime.config.watchGroup.root,
         runtimes: new Set(),
@@ -347,6 +549,46 @@ class LiveNpmServerManager {
 
     group.runtimes.add(runtime);
     await this.replaceWatchGroup(group);
+  }
+
+  private async unregisterRuntimeWatcher(runtime: RuntimePackage, watchGroupKey: string): Promise<void> {
+    const groupKey = watchGroupRuntimeKey(runtime.projectDir, watchGroupKey);
+    const group = this.watchGroups.get(groupKey);
+    if (!group) {
+      return;
+    }
+
+    group.runtimes.delete(runtime);
+    group.pendingPublishes.delete(runtime);
+    if (group.runtimes.size === 0) {
+      await group.watcher?.close();
+      this.watchGroups.delete(groupKey);
+      return;
+    }
+
+    await this.replaceWatchGroup(group, true);
+  }
+
+  private async removeRuntime(runtime: RuntimePackage, options: { deleteTargets: boolean }): Promise<void> {
+    this.runtimes.delete(runtimeKey(runtime.projectDir, runtime.config.name));
+    await this.unregisterRuntimeWatcher(runtime, runtime.config.watchGroup.key);
+
+    if (!options.deleteTargets) {
+      return;
+    }
+
+    await this.deletePackageTargets(runtime.projectDir, runtime.config.name, [...runtime.targets]);
+  }
+
+  private async deletePackageTargets(projectDir: string, packageName: string, targets: string[]): Promise<void> {
+    await Promise.all([...new Set(targets)].map(async (target) => {
+      if (!isSafeLiveTarget(projectDir, target)) {
+        this.logger.warn(`Refusing to delete live-npm target outside a managed location: ${target}`);
+        return;
+      }
+      await rm(target, { force: true, recursive: true });
+      this.logger.info(`${chalk.yellow('deleted')} ${formatPackageTarget(packageName, target)}`);
+    }));
   }
 
   private async replaceWatchGroup(group: WatchGroup, force = false): Promise<void> {
@@ -370,12 +612,16 @@ class LiveNpmServerManager {
 
     const schedule = debounce(async () => {
       try {
-        const pendingRuntimes = [...group.pendingRuntimes];
-        group.pendingRuntimes.clear();
+        const pendingPublishes = [...group.pendingPublishes];
+        group.pendingPublishes.clear();
         const pendingForceRewatch = group.pendingForceRewatch;
         group.pendingForceRewatch = false;
-        await Promise.all(pendingRuntimes.map(async (runtime) => {
-          await this.publishRuntime(runtime);
+        await Promise.all(pendingPublishes.map(async ([runtime, pending]) => {
+          if (pending.full) {
+            await this.publishRuntime(runtime);
+            return;
+          }
+          await this.publishRuntimeChanges(runtime, pending.changes);
         }));
         if (pendingForceRewatch) {
           await this.replaceWatchGroup(group, true);
@@ -406,8 +652,9 @@ class LiveNpmServerManager {
       };
       this.logger.debug(`${event} ${path.relative(group.root, changedPath)}`);
       for (const runtime of affectedRuntimes) {
-        group.pendingRuntimes.add(runtime);
-        if (isRuntimePackageJson(runtime, changedPath) || isShallowTargetHit(plan.shallowWatchPaths, changedPath)) {
+        const publishKind = this.getPublishKind(group, runtime, event, changedPath, plan.shallowWatchPaths);
+        queuePendingPublish(group, runtime, publishKind);
+        if (publishKind.forceRewatch) {
           group.pendingForceRewatch = true;
         }
       }
@@ -488,10 +735,71 @@ class LiveNpmServerManager {
     return [...group.runtimes];
   }
 
+  private getPublishKind(
+    group: WatchGroup,
+    runtime: RuntimePackage,
+    event: string,
+    changedPath: string,
+    shallowWatchPaths: ShallowWatchPath[],
+  ): PendingPublishKind {
+    if (isGroupMetadataPath(group, changedPath)) {
+      return {
+        forceRewatch: false,
+        full: true,
+      };
+    }
+    if (isRuntimePublishMetadata(runtime, changedPath)) {
+      return {
+        forceRewatch: true,
+        full: true,
+      };
+    }
+    if (isShallowTargetHit(shallowWatchPaths, changedPath)) {
+      return {
+        change: {
+          event,
+          path: changedPath,
+        },
+        forceRewatch: true,
+        full: false,
+      };
+    }
+    return {
+      change: {
+        event,
+        path: changedPath,
+      },
+      forceRewatch: false,
+      full: false,
+    };
+  }
+
   private async publishRuntime(runtime: RuntimePackage): Promise<void> {
     try {
       await Promise.all([...runtime.targets].map(async (target) => {
         await publishPackage(runtime.config.source, target, {
+          dryRun: false,
+          logger: this.logger,
+          ...(runtime.config.manifestRewrite ? { manifestRewrite: runtime.config.manifestRewrite } : {}),
+        });
+      }));
+      runtime.lastPublishAt = new Date().toISOString();
+      delete runtime.lastError;
+    } catch (error) {
+      runtime.lastError = formatErrorMessage(error);
+      throw error;
+    }
+  }
+
+  private async publishRuntimeChanges(runtime: RuntimePackage, changes: PublishFileChange[]): Promise<void> {
+    const dedupedChanges = dedupePublishChanges(changes);
+    if (dedupedChanges.length === 0) {
+      return;
+    }
+
+    try {
+      await Promise.all([...runtime.targets].map(async (target) => {
+        await publishPackageChanges(runtime.config.source, target, dedupedChanges, {
           dryRun: false,
           logger: this.logger,
           ...(runtime.config.manifestRewrite ? { manifestRewrite: runtime.config.manifestRewrite } : {}),
@@ -753,6 +1061,16 @@ function sortImports(imports: PersistedImport[]): PersistedImport[] {
   });
 }
 
+function groupImportsByPackage(imports: PersistedImport[]): Map<string, string[]> {
+  const targetsByPackage = new Map<string, string[]>();
+  for (const persistedImport of imports) {
+    const targets = targetsByPackage.get(persistedImport.packageName) ?? [];
+    targets.push(path.resolve(persistedImport.destinationDir));
+    targetsByPackage.set(persistedImport.packageName, targets);
+  }
+  return targetsByPackage;
+}
+
 async function loadProject(projectDir: string): Promise<{ debounceMs: number; packages: ResolvedLivePackage[] }> {
   const config = await loadConfig(path.join(projectDir, liveDirName, 'config.yaml'));
   return {
@@ -969,6 +1287,63 @@ function shouldIgnorePackageWatchPath(rule: PackageWatchRule, resolvedWatchPath:
   return true;
 }
 
+function queuePendingPublish(group: WatchGroup, runtime: RuntimePackage, publishKind: PendingPublishKind): void {
+  const pending = group.pendingPublishes.get(runtime) ?? {
+    changes: [],
+    full: false,
+  };
+
+  if (publishKind.full) {
+    pending.full = true;
+    pending.changes = [];
+  } else if (!pending.full) {
+    pending.changes.push(publishKind.change);
+  }
+
+  group.pendingPublishes.set(runtime, pending);
+}
+
+function dedupePublishChanges(changes: PublishFileChange[]): PublishFileChange[] {
+  const changeByPath = new Map<string, PublishFileChange>();
+  for (const change of changes) {
+    changeByPath.set(path.resolve(change.path), {
+      event: change.event,
+      path: path.resolve(change.path),
+    });
+  }
+  return [...changeByPath.values()];
+}
+
+function serializeResolvedLivePackage(config: ResolvedLivePackage): string {
+  return JSON.stringify({
+    extraWatchPaths: config.extraWatchPaths ?? [],
+    manifestRewrite: config.manifestRewrite ?? null,
+    name: config.name,
+    source: path.resolve(config.source),
+    watchGroup: {
+      kind: config.watchGroup.kind,
+      key: config.watchGroup.key,
+      root: path.resolve(config.watchGroup.root),
+    },
+  });
+}
+
+function isSafeLiveTarget(projectDir: string, target: string): boolean {
+  const resolvedTarget = path.resolve(target);
+  const parsedTarget = path.parse(resolvedTarget);
+  if (resolvedTarget === parsedTarget.root || resolvedTarget === path.resolve(projectDir)) {
+    return false;
+  }
+  if (isInsideOrSame(path.join(projectDir, liveDirName, storeDirName), resolvedTarget)) {
+    return true;
+  }
+  return hasPathSegment(resolvedTarget, 'node_modules');
+}
+
+function hasPathSegment(file: string, segment: string): boolean {
+  return path.resolve(file).split(path.sep).some((part) => part === segment);
+}
+
 function matchesShallowWatchPath(shallowWatchPaths: ShallowWatchPath[], changedPath: string): boolean {
   const resolvedChangedPath = path.resolve(changedPath);
   return shallowWatchPaths.some((watchPath) => {
@@ -977,6 +1352,11 @@ function matchesShallowWatchPath(shallowWatchPaths: ShallowWatchPath[], changedP
     return isInsideOrSame(root, resolvedChangedPath)
       && (isInsideOrSame(target, resolvedChangedPath) || isInsideOrSame(resolvedChangedPath, target));
   });
+}
+
+function isGroupMetadataPath(group: WatchGroup, changedPath: string): boolean {
+  const resolvedChangedPath = path.resolve(changedPath);
+  return group.metadataPaths.some((metadataPath) => isInsideOrSame(metadataPath, resolvedChangedPath));
 }
 
 function isShallowTargetHit(shallowWatchPaths: ShallowWatchPath[], changedPath: string): boolean {
@@ -995,8 +1375,14 @@ function isInsideOrSame(parent: string, child: string): boolean {
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
-function isRuntimePackageJson(runtime: RuntimePackage, changedPath: string): boolean {
-  return path.resolve(changedPath) === path.join(path.resolve(runtime.config.source), 'package.json');
+function isRuntimePublishMetadata(runtime: RuntimePackage, changedPath: string): boolean {
+  const resolvedChangedPath = path.resolve(changedPath);
+  if (resolvedChangedPath === path.join(path.resolve(runtime.config.source), 'package.json')) {
+    return true;
+  }
+  const basename = path.basename(resolvedChangedPath);
+  return (basename === '.npmignore' || basename === '.gitignore')
+    && isInsideOrSame(runtime.config.source, resolvedChangedPath);
 }
 
 function formatPackageTarget(packageName: string, target: string): string {

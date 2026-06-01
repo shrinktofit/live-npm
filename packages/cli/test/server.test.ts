@@ -46,11 +46,17 @@ describe('startLiveNpmServer', () => {
     }, root);
 
     await expect(readFile(path.join(target, 'lib/index.js'), 'utf8')).resolves.toContain('value = 1');
+    await writeFile(path.join(source, 'lib/other.js'), 'export const other = 1;\n');
+    await waitFor(async () => {
+      await expect(readFile(path.join(target, 'lib/other.js'), 'utf8')).resolves.toContain('other = 1');
+    });
 
-    await writeSourcePackage(source, 'export const value = 2;\n');
+    await writeFile(path.join(target, 'lib/other.js'), 'stale unrelated target\n');
+    await writeFile(path.join(source, 'lib/index.js'), 'export const value = 2;\n');
     await waitFor(async () => {
       await expect(readFile(path.join(target, 'lib/index.js'), 'utf8')).resolves.toContain('value = 2');
     });
+    await expect(readFile(path.join(target, 'lib/other.js'), 'utf8')).resolves.toContain('stale unrelated target');
   });
 
   it('keeps packages with globbed files entries live when nested build output is added', async () => {
@@ -130,8 +136,8 @@ describe('startLiveNpmServer', () => {
     await writeFile(path.join(source, 'public/index.css'), 'body { color: red; }\n');
     await waitFor(async () => {
       await expect(readFile(path.join(target, 'public/index.css'), 'utf8')).resolves.toContain('color: red');
-      await expect(readFile(path.join(target, 'lib/index.js'), 'utf8')).resolves.toContain('value = 1');
     });
+    await expect(readFile(path.join(target, 'lib/index.js'), 'utf8')).resolves.toContain('stale target');
   });
 
   it('rebuilds package watchers when package.json publish files change', async () => {
@@ -211,6 +217,141 @@ describe('startLiveNpmServer', () => {
     await expect(readFile(path.join(target, 'lib/index.js'), 'utf8')).resolves.toContain('stale target');
   });
 
+  it('fully republishes packages when package ignore files change', async () => {
+    const root = await makeTempDir();
+    const source = path.join(root, 'source');
+    const target = path.join(root, 'node_modules/.pnpm/live/node_modules/sample-package');
+    await mkdir(path.join(source, 'lib'), { recursive: true });
+    await writeFile(path.join(source, 'package.json'), JSON.stringify({
+      name: 'sample-package',
+      version: '0.0.0',
+    }, null, 2));
+    await writeFile(path.join(source, 'lib/index.js'), 'export const value = 1;\n');
+    await writeFile(path.join(source, 'lib/other.js'), 'export const other = 1;\n');
+    await mkdir(path.join(root, '.live-npm'), { recursive: true });
+    await writeFile(path.join(root, '.live-npm/config.yaml'), [
+      'debounceMs: 25',
+      'packages:',
+      '  - source: ../source',
+      '',
+    ].join('\n'));
+
+    server = await startLiveNpmServer({
+      host: '127.0.0.1',
+      logger: silentLogger,
+      port: 0,
+      projectDirs: [root],
+    });
+
+    await postJson(server.url, '/register-import', {
+      destinationDir: target,
+      packageName: 'sample-package',
+      projectDir: root,
+    }, root);
+
+    await expect(readFile(path.join(target, 'lib/index.js'), 'utf8')).resolves.toContain('value = 1');
+    await expect(readFile(path.join(target, 'lib/other.js'), 'utf8')).resolves.toContain('other = 1');
+
+    await writeFile(path.join(target, 'lib/index.js'), 'stale target\n');
+    await writeFile(path.join(source, '.npmignore'), 'lib/other.js\n');
+
+    await waitFor(async () => {
+      await expect(readFile(path.join(target, 'lib/index.js'), 'utf8')).resolves.toContain('value = 1');
+      await expect(readFile(path.join(target, 'lib/other.js'), 'utf8')).rejects.toThrow();
+    });
+  });
+
+  it('reloads config and deletes targets for removed direct packages', async () => {
+    const root = await makeTempDir();
+    const sourceA = path.join(root, 'source-a');
+    const sourceB = path.join(root, 'source-b');
+    const targetA = path.join(root, 'node_modules/.pnpm/live-a/node_modules/package-a');
+    const targetB = path.join(root, 'node_modules/.pnpm/live-b/node_modules/package-b');
+    await writeNamedSourcePackage(sourceA, 'package-a', 'export const value = "a1";\n');
+    await writeNamedSourcePackage(sourceB, 'package-b', 'export const value = "b1";\n');
+    await mkdir(path.join(root, '.live-npm'), { recursive: true });
+    await writeFile(path.join(root, '.live-npm/config.yaml'), [
+      'debounceMs: 25',
+      'packages:',
+      '  - source: ../source-a',
+      '  - source: ../source-b',
+      '',
+    ].join('\n'));
+
+    server = await startLiveNpmServer({
+      host: '127.0.0.1',
+      logger: silentLogger,
+      port: 0,
+      projectDirs: [root],
+    });
+
+    await postJson(server.url, '/register-import', {
+      destinationDir: targetA,
+      packageName: 'package-a',
+      projectDir: root,
+    }, root);
+    await postJson(server.url, '/register-import', {
+      destinationDir: targetB,
+      packageName: 'package-b',
+      projectDir: root,
+    }, root);
+    await expect(readFile(path.join(targetB, 'lib/index.js'), 'utf8')).resolves.toContain('"b1"');
+
+    await writeFile(path.join(root, '.live-npm/config.yaml'), [
+      'debounceMs: 25',
+      'packages:',
+      '  - source: ../source-a',
+      '',
+    ].join('\n'));
+
+    const serverUrl = server.url;
+    await waitFor(async () => {
+      await expect(readFile(path.join(targetB, 'lib/index.js'), 'utf8')).rejects.toThrow();
+      await expect(readFile(path.join(root, '.live-npm/store/package-b/package.json'), 'utf8')).rejects.toThrow();
+      const status = await readStatus(root, serverUrl);
+      expect(status.packages.map((statusPackage) => statusPackage.name)).toEqual(['package-a']);
+      await expect(readFile(path.join(root, '.live-npm/state.json'), 'utf8')).resolves.not.toContain('package-b');
+    });
+
+    await expect(readFile(path.join(targetA, 'lib/index.js'), 'utf8')).resolves.toContain('"a1"');
+  });
+
+  it('keeps the current runtime when config reload fails', async () => {
+    const root = await makeTempDir();
+    const source = path.join(root, 'source');
+    const target = path.join(root, 'node_modules/.pnpm/live/node_modules/sample-package');
+    await writeSourcePackage(source, 'export const value = 1;\n');
+    await mkdir(path.join(root, '.live-npm'), { recursive: true });
+    await writeFile(path.join(root, '.live-npm/config.yaml'), [
+      'debounceMs: 25',
+      'packages:',
+      '  - source: ../source',
+      '',
+    ].join('\n'));
+
+    server = await startLiveNpmServer({
+      host: '127.0.0.1',
+      logger: silentLogger,
+      port: 0,
+      projectDirs: [root],
+    });
+
+    await postJson(server.url, '/register-import', {
+      destinationDir: target,
+      packageName: 'sample-package',
+      projectDir: root,
+    }, root);
+    await expect(readFile(path.join(target, 'lib/index.js'), 'utf8')).resolves.toContain('value = 1');
+
+    await writeFile(path.join(root, '.live-npm/config.yaml'), 'packages: not-an-array\n');
+    await sleep(300);
+    await writeFile(path.join(source, 'lib/index.js'), 'export const value = 2;\n');
+
+    await waitFor(async () => {
+      await expect(readFile(path.join(target, 'lib/index.js'), 'utf8')).resolves.toContain('value = 2');
+    });
+  });
+
   it('shares one watcher for packages from the same workspace and routes package events', async () => {
     const root = await makeTempDir();
     const workspace = path.join(root, 'workspace');
@@ -278,6 +419,80 @@ describe('startLiveNpmServer', () => {
       await expect(readFile(path.join(targetA, 'lib/index.js'), 'utf8')).resolves.toContain('"a2"');
     });
     await expect(readFile(path.join(targetB, 'lib/index.js'), 'utf8')).resolves.toContain('"b1"');
+  });
+
+  it('reloads workspace includes and deletes targets that leave the dependency closure', async () => {
+    const root = await makeTempDir();
+    const workspace = path.join(root, 'workspace');
+    const targetA = path.join(root, 'node_modules/.pnpm/live-a/node_modules/package-a');
+    const targetB = path.join(root, 'node_modules/.pnpm/live-b/node_modules/package-b');
+    await writeWorkspacePackage(workspace, 'packages/a', {
+      dependencies: {
+        'package-b': 'workspace:*',
+      },
+      name: 'package-a',
+      version: '1.0.0',
+    }, 'export const value = "a1";\n');
+    await writeWorkspacePackage(workspace, 'packages/b', {
+      name: 'package-b',
+      version: '1.0.0',
+    }, 'export const value = "b1";\n');
+    await writeFile(path.join(workspace, 'package.json'), JSON.stringify({
+      packageManager: 'pnpm@10.0.0',
+      private: true,
+    }, null, 2));
+    await writeFile(path.join(workspace, 'pnpm-workspace.yaml'), [
+      'packages:',
+      '  - packages/*',
+      '',
+    ].join('\n'));
+    await mkdir(path.join(root, '.live-npm'), { recursive: true });
+    await writeFile(path.join(root, '.live-npm/config.yaml'), [
+      'debounceMs: 25',
+      'workspaces:',
+      '  - path: ../workspace',
+      '    includes:',
+      '      - package-a',
+      '',
+    ].join('\n'));
+
+    server = await startLiveNpmServer({
+      host: '127.0.0.1',
+      logger: silentLogger,
+      port: 0,
+      projectDirs: [root],
+    });
+
+    await postJson(server.url, '/register-import', {
+      destinationDir: targetA,
+      packageName: 'package-a',
+      projectDir: root,
+    }, root);
+    await postJson(server.url, '/register-import', {
+      destinationDir: targetB,
+      packageName: 'package-b',
+      projectDir: root,
+    }, root);
+    await expect(readFile(path.join(targetA, 'lib/index.js'), 'utf8')).resolves.toContain('"a1"');
+    await expect(readFile(path.join(targetB, 'lib/index.js'), 'utf8')).resolves.toContain('"b1"');
+
+    await writeFile(path.join(root, '.live-npm/config.yaml'), [
+      'debounceMs: 25',
+      'workspaces:',
+      '  - path: ../workspace',
+      '    includes:',
+      '      - package-b',
+      '',
+    ].join('\n'));
+
+    const serverUrl = server.url;
+    await waitFor(async () => {
+      await expect(readFile(path.join(targetA, 'lib/index.js'), 'utf8')).rejects.toThrow();
+      await expect(readFile(path.join(targetB, 'lib/index.js'), 'utf8')).resolves.toContain('"b1"');
+      const status = await readStatus(root, serverUrl);
+      expect(status.packages.map((statusPackage) => statusPackage.name)).toEqual(['package-b']);
+      await expect(readFile(path.join(root, '.live-npm/state.json'), 'utf8')).resolves.not.toContain('package-a');
+    });
   });
 
   it('publishes every package in a workspace watch group when workspace metadata changes', async () => {
@@ -783,6 +998,16 @@ async function readStatus(root: string, baseUrl: string): Promise<StatusResponse
 async function writeSourcePackage(source: string, contents: string, files: string[] = ['lib']): Promise<void> {
   await mkdir(path.join(source, 'lib'), { recursive: true });
   await writeSourceManifest(source, files);
+  await writeFile(path.join(source, 'lib/index.js'), contents);
+}
+
+async function writeNamedSourcePackage(source: string, name: string, contents: string): Promise<void> {
+  await mkdir(path.join(source, 'lib'), { recursive: true });
+  await writeFile(path.join(source, 'package.json'), JSON.stringify({
+    files: ['lib'],
+    name,
+    version: '0.0.0',
+  }, null, 2));
   await writeFile(path.join(source, 'lib/index.js'), contents);
 }
 
